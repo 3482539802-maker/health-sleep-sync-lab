@@ -1,0 +1,15 @@
+{
+  "adb": "adb",
+  "serial": "emulator-5554",
+  "package": "com.huawei.health",
+  "process": "com.huawei.health:DaemonService",
+  "app_version": "17.0.8.310",
+  "transport_class": "lvv",
+  "gson_factory_class": "oxm",
+  "frida_remote_port": 27060,
+  "emulator_verified": false,
+  "expected_emulator_model": "",
+  "expected_emulator_board": "",
+  "date": "2001-01-01",
+  "timezone": "+08:00"
+}

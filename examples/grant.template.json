@@ -1,0 +1,7 @@
+{
+  "date": "2001-01-01",
+  "plan_sha256": "REPLACE_WITH_HASH_OF_REVIEWED_PRIVATE_PLAN",
+  "allow_rebuild": false,
+  "official_phone_day_deletion_verified": false,
+  "allow_restore_original_score": false
+}
