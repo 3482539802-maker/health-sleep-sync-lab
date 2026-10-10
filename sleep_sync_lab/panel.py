@@ -10,6 +10,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from .automation import execute, load, prepare, private
 from .automation_model import describe
+from .errors import user_message
 
 
 def numeric(text):
@@ -135,8 +136,8 @@ class Panel:
         def worker():
             try:
                 self.events.put(('done', fn()))
-            except Exception:
-                self.events.put(('error', '操作停止。请检查输入和私有备份目录中的失败记录；已有写入计划不要重复执行。'))
+            except Exception as error:
+                self.events.put(('error', user_message(error)))
         threading.Thread(target=worker, daemon=False).start()
 
     def prepare(self):
@@ -242,9 +243,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config')
     parser.add_argument('--runs')
+    parser.add_argument('--plan', help='Resume a saved private plan without executing it')
     args = parser.parse_args()
     root = tk.Tk()
-    Panel(root, args.config, args.runs)
+    panel = Panel(root, args.config, args.runs)
+    if args.plan:
+        path = private(args.plan)
+        plan = load(path)
+        panel.plan_path = path
+        panel.date.set(plan['config']['date'])
+        for key in ['calorie', 'exercise', 'steps', 'active']:
+            value = plan['request'].get(key)
+            panel.vars[key].set('-'.join(map(str, value)) if isinstance(value, list) else '' if value is None else str(value))
+        panel.show_review(describe(plan))
+        panel.status.set('已恢复保存的计划；启动不会执行。请查看目标与日期。')
     root.mainloop()
 
 

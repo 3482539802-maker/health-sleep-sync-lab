@@ -7,6 +7,7 @@ from pathlib import Path
 from importlib.resources import files
 from .client import Client
 from .model import check
+from .errors import PanelOperationError
 
 
 class AutomationClient(Client):
@@ -14,6 +15,27 @@ class AutomationClient(Client):
         result = subprocess.run([self.config['adb'], '-s', self.config['serial'], 'shell', 'pidof',
                                  self.config['process']], capture_output=True, timeout=40)
         return bool(result.stdout.strip())
+
+    def launch_original(self):
+        """Launch the resolved original activity directly, never generate monkey events."""
+        try:
+            resolved = self.adb('shell', 'cmd', 'package', 'resolve-activity', '--brief',
+                                '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER',
+                                self.config['package'])
+            components = [line.strip() for line in resolved.splitlines()
+                          if re.fullmatch(r'com\.huawei\.health/[A-Za-z0-9_.$]+', line.strip())]
+            if len(components) != 1:
+                raise PanelOperationError('未找到电脑原版运动健康的启动入口，尚未写入。')
+            self.adb('shell', 'am', 'start', '-W', '-n', components[0])
+        except PanelOperationError:
+            raise
+        except Exception as error:
+            raise PanelOperationError('无法启动电脑原版运动健康，尚未写入。请检查模拟器连接和应用状态。') from error
+        for _ in range(40):
+            if self.process_exists():
+                return
+            time.sleep(.25)
+        raise PanelOperationError('电脑原版已打开，但健康后台未就绪，尚未写入。请查看私有失败记录。')
 
     def __init__(self, config):
         super().__init__(config)
@@ -50,11 +72,7 @@ class AutomationClient(Client):
         try:
             self.adb('shell', 'am', 'force-stop', self.config['package'])
             self.set_offline(True)
-            self.adb('shell', 'monkey', '-p', self.config['package'], '-c', 'android.intent.category.LAUNCHER', '1')
-            for _ in range(40):
-                if self.process_exists():
-                    break
-                time.sleep(.25)
+            self.launch_original()
             super().__enter__()
             self.script.unload()
             source = files('frida_tools').joinpath('bridges/java.js').read_text(encoding='utf-8') + '\n;globalThis.Java=bridge;\n'

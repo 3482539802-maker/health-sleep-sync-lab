@@ -9,6 +9,7 @@ import traceback
 from .automation_client import AutomationClient
 from .automation_model import build_plan, canonical, describe, fingerprint, validate_automation_plan
 from .model import bounds, check, content, digest, rows
+from .errors import user_message
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 
@@ -28,6 +29,14 @@ def save(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('x', encoding='utf-8') as handle:
         json.dump(value, handle, ensure_ascii=False, indent=2)
+
+
+def save_failure(directory, name, value):
+    # Preserve earlier failures even when connection preparation is retried before writes.
+    path = directory / name
+    if path.exists():
+        path = directory / (Path(name).stem + '_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.json')
+    save(path, value)
 
 
 def successful(value):
@@ -73,8 +82,8 @@ def prepare(config, request, directory, log=lambda message: None):
         save(directory / 'review_private.json', describe(plan))
         log('备份和固定计划已保存；尚未修改健康记录。')
         return directory / 'plan_private.json'
-    except Exception:
-        save(directory / 'prepare_failure_private.json', {'traceback': traceback.format_exc()})
+    except Exception as error:
+        save_failure(directory, 'prepare_failure_private.json', {'traceback': traceback.format_exc(), 'message': user_message(error)})
         raise
 
 
@@ -220,8 +229,8 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None):
             save(directory / 'result_private.json', result)
             log('执行已结束；请按结果核对云端采用情况，并在手机正常同步验收。')
             return result
-    except Exception:
-        save(directory / 'apply_failure_private.json', {'writes_may_have_started': wrote, 'traceback': traceback.format_exc()})
+    except Exception as error:
+        save_failure(directory, 'apply_failure_private.json', {'writes_may_have_started': wrote, 'traceback': traceback.format_exc(), 'message': user_message(error)})
         raise
     finally:
         lock.unlink(missing_ok=True)
