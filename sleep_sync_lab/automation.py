@@ -80,6 +80,7 @@ def prepare(config, request, directory, log=lambda message: None):
         event(directory, 'prepare_begin')
         with AutomationClient(config) as client:
             event(directory, 'session_ready', phase='prepare')
+            save(directory / 'session_guard_private.json', client.guard_state())
             snapshot = snapshot_with_retry(client)
             if request.get('sleep'):
                 snapshot['local_sleep'] = client.local_sleep()
@@ -117,22 +118,29 @@ def semantic_health(record):
     return (health_key(record), tuple(result))
 
 
-def check_baseline(actual, expected, plan):
+def check_baseline(actual, expected, plan, phone_deleted=False):
     domains = ['sport', 'sport_stats', 'intensity', 'active']
-    if plan['sleep']:
+    if plan['sleep'] and not phone_deleted:
         domains += ['sleep', 'sleep_stats', 'local_sleep']
     for domain in domains:
         successful(actual[domain])
         check(actual[domain] == expected[domain], 'Selected cloud data changed after preview; create a new plan')
+    if plan['sleep'] and phone_deleted:
+        successful(actual['sleep'])
+        successful(actual['sleep_stats'])
+        check(not rows(actual['sleep']) and not (actual['sleep_stats'].get('professionalSleepTotal') or []),
+              'Phone night deletion and empty cloud segments/summary required before rebuild')
 
 
-def execute(plan_path, allow_sleep_delete=False, log=lambda message: None):
+def execute(plan_path, allow_sleep_delete=False, log=lambda message: None, phone_deleted=False):
     plan_path = private(plan_path)
     directory = plan_path.parent
     plan = validate_automation_plan(load(plan_path))
     plan_hash = digest(plan_path)
     check(not (directory / 'apply_started_private.json').exists(), 'An execution marker exists; do not repeat this plan')
     check(not plan['sleep'] or allow_sleep_delete is True, 'Explicit selected-night deletion confirmation required')
+    check(not plan['sleep'] or phone_deleted is True,
+          'Phone night deletion and empty cloud segments/summary required before rebuild')
     lock = directory.parent / '.health_panel.lock'
     try:
         with lock.open('x', encoding='utf-8') as handle:
@@ -145,15 +153,16 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None):
         event(directory, 'apply_begin', plan_sha256=plan_hash, sleep_delete_authorized=bool(allow_sleep_delete))
         with AutomationClient(plan['config']) as client:
             event(directory, 'session_ready', phase='apply')
+            save(directory / 'session_guard_private.json', client.guard_state())
             current = snapshot_with_retry(client)
             if plan['sleep']:
                 current['local_sleep'] = client.local_sleep()
             save(directory / 'before_apply_private.json', current)
-            check_baseline(current, plan['baseline'], plan)
+            check_baseline(current, plan['baseline'], plan, phone_deleted=phone_deleted)
             check(digest(plan_path) == plan_hash, 'Plan changed while checking backup')
             event(directory, 'baseline_verified', plan_sha256=plan_hash)
             save(directory / 'apply_started_private.json', {'plan_sha256': plan_hash,
-                 'sleep_delete_authorized': bool(allow_sleep_delete), 'local_time': datetime.now().astimezone().isoformat()})
+                 'sleep_delete_authorized': bool(allow_sleep_delete), 'phone_deleted_confirmed': bool(phone_deleted), 'local_time': datetime.now().astimezone().isoformat()})
             wrote = True
 
             def operation(name, fn):
@@ -202,17 +211,41 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None):
                 # Clear PC old segments too, rather than leave a known stale upload source.
                 save(directory / 'local_sleep_clear_started_private.json', {'scope': local_scope})
                 event(directory, 'operation_begin', operation='local_sleep_clear', scope=local_scope)
-                local = client.clear_local_sleep(local_scope['start'], local_scope['end'])
+                if current['local_sleep'].get('intervals') or current['local_sleep'].get('pendingDeletes'):
+                    local = client.clear_local_sleep(local_scope['start'], local_scope['end'])
+                else:
+                    # A previous stopped repair may already have cleared core rows.
+                    # Do not treat the native "nothing to delete" false as corruption.
+                    local = {'localCleared': True, 'localClearNotNeeded': True, 'phoneLocalCleared': False}
                 save(directory / 'local_sleep_clear_response_private.json', local)
-                check(local.get('localCleared') is True, 'PC local sleep deletion not confirmed; cloud not deleted')
+                check(local.get('localCleared') is True, 'PC local deletion was not accepted')
+                after_local = client.local_sleep()
+                save(directory / 'local_sleep_clear_readback_private.json', after_local)
+                successful(after_local)
+                check(not any(int(r['start']) < local_scope['end'] and int(r['end']) > local_scope['start']
+                              for r in after_local['intervals']), 'PC old sleep remains after local deletion')
                 event(directory, 'local_sleep_clear_verified')
                 client.configure(delete_scope=scope)
-                operation('sleep_delete', lambda: client.delete_sleep(scope['start'], scope['end']))
-                remaining = client.health_read(9, scope['start'], scope['end'])
+                # Phone UI deletion already propagated. Do not queue a second cloud deletion.
+                remaining = client.health_read(9, client.config['sleep_query_start_ms'], client.config['sleep_query_end_ms'])
                 save(directory / 'sleep_after_delete_private.json', remaining)
                 successful(remaining)
                 check(not rows(remaining), 'Old sleep still in cloud; no rebuild')
+                empty_stats = client.stats()
+                save(directory / 'sleep_summary_after_phone_delete_private.json', empty_stats)
+                successful(empty_stats)
+                check(not (empty_stats.get('professionalSleepTotal') or []),
+                      'Phone night deletion and empty cloud segments/summary required before rebuild')
                 event(directory, 'sleep_cloud_empty_verified')
+                client.configure(delete_scope=local_scope, sleep_cloud_empty_verified=True)
+                operation('sleep_retire_acknowledged_local_deletes', lambda: client.retire_acknowledged_sleep_deletes(local_scope['start'], local_scope['end']))
+                settled = client.local_sleep()
+                save(directory / 'sleep_local_settled_private.json', settled)
+                successful(settled)
+                check(not settled.get('pendingDeletes') and not settled.get('pendingSummaryDeletes') and
+                      not settled.get('pendingDictionaryDeletes'),
+                      'Pending sleep deletions remain; rebuild refused')
+                check(not settled['intervals'] and not settled.get('dictionaryIntervals'), 'PC old sleep remains after local deletion')
                 client.configure(write_scope={'start': s['target_start'], 'end': s['target_end']})
                 for batch, offset in enumerate(range(0, len(s['target']), 200)):
                     items = s['target'][offset:offset + 200]
@@ -226,6 +259,20 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None):
                 total = copy.deepcopy(s['summary'])
                 total['generateTime'] = str(int(time.time() * 1000))
                 operation('sleep_summary', lambda: client.sleep_summary(total))
+                # Verify the entire old+new window twice; a target-only read hides old tails.
+                for index in range(2):
+                    time.sleep(2)
+                    stable = client.health_read(9, client.config['sleep_query_start_ms'], client.config['sleep_query_end_ms'])
+                    save(directory / ('sleep_full_window_stability_' + str(index) + '_private.json'), stable)
+                    successful(stable)
+                    check({semantic_health(r) for r in rows(stable)} == {semantic_health(r) for r in s['target']},
+                          'Sleep changed or old tail returned during verification')
+                    local_settled = client.local_sleep()
+                    save(directory / ('sleep_local_stability_' + str(index) + '_private.json'), local_settled)
+                    successful(local_settled)
+                    check(not local_settled.get('pendingDeletes') and not local_settled.get('pendingSummaryDeletes') and
+                          not local_settled.get('pendingDictionaryDeletes'),
+                          'Pending sleep deletions remain; rebuild refused')
             final = snapshot_with_retry(client)
             save(directory / 'final_private.json', final)
             total = final['sport_stats']['sportStat'][0]
@@ -241,12 +288,15 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None):
                 final_sleep = client.health_read(9, plan['sleep']['target_start'], plan['sleep']['target_end'])
                 save(directory / 'sleep_final_scoped_private.json', final_sleep)
                 successful(final_sleep)
-                result['sleep_cloud_segments_match'] = {semantic_health(r) for r in rows(final_sleep)} == {semantic_health(r) for r in plan['sleep']['target']}
+                result['sleep_cloud_segments_match'] = {semantic_health(r) for r in rows(final['sleep'])} == {semantic_health(r) for r in plan['sleep']['target']}
                 totals = final['sleep_stats'].get('professionalSleepTotal') or []
                 result['sleep_cloud_summary_match'] = len(totals) == 1 and all(
                     totals[0]['professionalSleep'].get(k) == plan['sleep']['summary']['professionalSleep'].get(k)
                     for k in ['allSleepTime', 'lightSleepTime', 'deepSleepTime', 'dreamTime', 'fallAsleepTime', 'wakeupTime', 'sleepScore'])
+                check(result['sleep_cloud_segments_match'] and result['sleep_cloud_summary_match'],
+                      'Sleep full window or summary changed; verification failed')
             save(directory / 'result_private.json', result)
+            save(directory / 'guard_finish_private.json', client.guard_state())
             event(directory, 'apply_complete', phone_verification_pending=True)
             log('执行已结束；请按结果核对云端采用情况，并在手机正常同步验收。')
             return result
@@ -269,6 +319,7 @@ def main():
     apply = sub.add_parser('apply')
     apply.add_argument('--plan', required=True)
     apply.add_argument('--allow-sleep-delete', action='store_true')
+    apply.add_argument('--phone-night-deleted', action='store_true')
     review = sub.add_parser('review')
     review.add_argument('--plan', required=True)
     args = parser.parse_args()
@@ -279,7 +330,7 @@ def main():
         elif args.action == 'review':
             result = describe(load(private(args.plan)))
         else:
-            result = execute(args.plan, allow_sleep_delete=args.allow_sleep_delete)
+            result = execute(args.plan, allow_sleep_delete=args.allow_sleep_delete, phone_deleted=args.phone_night_deleted)
         print(json.dumps(result, ensure_ascii=True))
         return 0
     except Exception:

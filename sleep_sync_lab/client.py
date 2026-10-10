@@ -51,6 +51,10 @@ class Client:
     def restore_score(self,total):return self.script.exports_sync.restore_score(json.dumps(total))
     def __exit__(self,*exc):
         try:
-            if self.session:self.session.detach()
+            if self.session:
+                self.session.detach()
+                self.session=None
         finally:
-            if self.forward_created:self.adb('forward','--remove','tcp:'+str(self.config['frida_remote_port']))
+            if self.forward_created:
+                self.adb('forward','--remove','tcp:'+str(self.config['frida_remote_port']))
+                self.forward_created=False

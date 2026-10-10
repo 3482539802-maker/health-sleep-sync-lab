@@ -3,6 +3,12 @@
 let autoPermit=null,autoBlocked={},autoGuarded=[];
 function autoCtx(){return {...context(),app:Java.use('android.app.ActivityThread').currentApplication()};}
 function autoRun(action){return nativeCall(action);}
+function autoSleepDictionaryTypes(){
+ const E=Java.use('com.huawei.hihealth.dictionary.utils.DicDataTypeUtil$DataType'),types=[];
+ for(const e of E.values())if(/^(SLEEP_RECORD|SLEEP_ON_OFF_BED_RECORD)(_|$)/.test(String(e.name())))types.push(Number(e.value()));
+ if(!types.length||types.some(x=>!Number.isSafeInteger(x)))throw new Error('Sleep dictionary adapter unavailable');
+ return types;
+}
 function autoPost(name,req,q){
  const {transport,gson}=autoCtx();
  autoPermit={thread:String(Java.use('java.lang.Thread').currentThread().getId()),req,
@@ -18,6 +24,8 @@ function autoHealth(type,start,end){
 }
 Object.assign(rpc.exports,{
  autoGuard(){return autoRun(()=>{
+  // ART can inline calls compiled before attachment; hooks alone are insufficient.
+  Java.deoptimizeEverything();
   const {transport,gson}=autoCtx(),T=use(config.transport_class);
   for(const [name,req,rsp] of [
    ['e','AddHealthDataReq','AddHealthDataRsp'],['a','AddHealthStatReq','AddHealthStatRsp'],
@@ -71,10 +79,16 @@ Object.assign(rpc.exports,{
    onMatch(x){if(db===null&&x.isOpen()&&String(x.getPath()).endsWith('/hihealth_003.db'))db=Java.retain(x);},
    onComplete(){try{
     if(db===null)throw new Error('Original local database unavailable');
-    const sql='SELECT start_time,end_time,type_id,client_id,sync_status,merged FROM sample_session_core WHERE start_time>='+config.sleep_query_start_ms+' AND start_time<='+config.sleep_query_end_ms+' AND sync_status<>2 AND type_id BETWEEN 22100 AND 22199 ORDER BY start_time';
-    const c=db.rawQuery.overload('java.lang.String','[Ljava.lang.String;').call(db,sql,Java.array('java.lang.String',[])),intervals=[];
-    try{while(c.moveToNext())intervals.push({start:Number(c.getLong(0)),end:Number(c.getLong(1)),type:Number(c.getInt(2)),client:Number(c.getInt(3)),sync:Number(c.getInt(4)),merged:Number(c.getInt(5))});}finally{c.close();}
-    resolve({resultCode:0,intervals});
+    const sql='SELECT start_time,end_time,type_id,client_id,sync_status,merged FROM sample_session_core WHERE start_time>='+config.sleep_query_start_ms+' AND start_time<='+config.sleep_query_end_ms+' AND type_id BETWEEN 22100 AND 22199 ORDER BY start_time';
+    const c=db.rawQuery.overload('java.lang.String','[Ljava.lang.String;').call(db,sql,Java.array('java.lang.String',[])),intervals=[],pendingDeletes=[];
+    try{while(c.moveToNext()){const row={start:Number(c.getLong(0)),end:Number(c.getLong(1)),type:Number(c.getInt(2)),client:Number(c.getInt(3)),sync:Number(c.getInt(4)),merged:Number(c.getInt(5))};(row.sync===2?pendingDeletes:intervals).push(row);}}finally{c.close();}
+    const s=db.rawQuery.overload('java.lang.String','[Ljava.lang.String;').call(db,'SELECT COUNT(*) FROM hihealth_stat_day WHERE date='+config.record_day+' AND stat_type BETWEEN 44100 AND 44299 AND sync_status=2',Java.array('java.lang.String',[]));
+    let pendingSummaryDeletes=0;try{if(s.moveToFirst())pendingSummaryDeletes=Number(s.getInt(0));}finally{s.close();}
+    const types=autoSleepDictionaryTypes();
+    const p=db.rawQuery.overload('java.lang.String','[Ljava.lang.String;').call(db,'SELECT start_time,end_time,type_id,sync_status FROM sample_point_health WHERE start_time<='+config.sleep_query_end_ms+' AND end_time>='+config.sleep_query_start_ms+' AND type_id IN ('+types.join(',')+')',Java.array('java.lang.String',[]));
+    const dictionaryIntervals=[],pendingDictionaryDeletes=[];
+    try{while(p.moveToNext()){const row={start:Number(p.getLong(0)),end:Number(p.getLong(1)),type:Number(p.getInt(2)),sync:Number(p.getInt(3))};(row.sync===2?pendingDictionaryDeletes:dictionaryIntervals).push(row);}}finally{p.close();}
+    resolve({resultCode:0,intervals,pendingDeletes,pendingSummaryDeletes,dictionaryIntervals,pendingDictionaryDeletes});
    }catch(e){reject(new Error(String(e)));}finally{if(db)db.$dispose();}}
   });
  }));},
@@ -121,5 +135,29 @@ Object.assign(rpc.exports,{
   const {app}=autoCtx(),U=use('kyz'),user=U.a().d(),B=use('lbk'),clients=B.c().h(user),K=use('lkx'),store=K.a.overload('android.content.Context').call(K,app);
   const types=Java.array('int',Array.from({length:100},(_,i)=>22100+i));
   return {localCleared:store.a.overload('long','long','[I','java.util.List','int').call(store,start,end,types,clients,user),phoneLocalCleared:false};
- });}
+ });},
+ autoRetireAcknowledgedSleepDeletes(start,end){return autoRun(()=>new Promise((resolve,reject)=>{
+  if(!config.delete_scope||start!==config.delete_scope.start||end!==config.delete_scope.end||config.sleep_cloud_empty_verified!==true){reject(new Error('No verified cloud deletion; local tombstones retained'));return;}
+  let db=null;Java.choose('net.zetetic.database.sqlcipher.SQLiteDatabase',{
+   onMatch(x){if(db===null&&x.isOpen()&&String(x.getPath()).endsWith('/hihealth_003.db'))db=Java.retain(x);},
+   onComplete(){let transaction=false;try{
+    if(!db)throw new Error('Original local database unavailable');
+    const types=autoSleepDictionaryTypes();
+    const conditions={sample_session_core:'start_time>='+start+' AND end_time<='+end+' AND type_id BETWEEN 22100 AND 22199 AND sync_status=2',
+     hihealth_stat_day:'date='+config.record_day+' AND stat_type BETWEEN 44100 AND 44299 AND sync_status=2',
+     // lkx leaves on/off-bed fields when risingTime equals the exact cleanup end.
+     // The phone/cloud night is confirmed gone: remove those same-night local
+     // dictionary values too, including synced values, without queuing another RPC.
+     sample_point_health:'start_time>='+start+' AND end_time<='+end+' AND type_id IN ('+types.join(',')+')'};
+    db.beginTransaction();transaction=true;const retired={};
+    for(const [table,where] of Object.entries(conditions)){
+     const c=db.rawQuery.overload('java.lang.String','[Ljava.lang.String;').call(db,'SELECT COUNT(*) FROM '+table+' WHERE '+where,Java.array('java.lang.String',[]));
+     try{c.moveToFirst();retired[table]=Number(c.getInt(0));}finally{c.close();}
+     db.execSQL.overload('java.lang.String').call(db,'DELETE FROM '+table+' WHERE '+where);
+    }
+    db.setTransactionSuccessful();resolve({resultCode:0,retired,scope:{start,end},cloudDeletionPreviouslyVerified:true,
+     residualDictionaryCleanupIncluded:true});
+   }catch(e){reject(new Error(String(e)));}finally{if(transaction)db.endTransaction();if(db)db.$dispose();}}
+  });
+ }));}
 });

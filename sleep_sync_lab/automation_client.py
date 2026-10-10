@@ -43,6 +43,13 @@ class AutomationClient(Client):
         self.uid = None
         self.validated = False
         self.lock_owned = False
+        self.extra_sessions = []
+        self.guard_reports = []
+        self.guard_scripts = []
+        self.guarded_pids = set()
+        self.spawn_device = None
+        self.paused_spawns = []
+        self.quarantine_confirmed = False
         self.session_lock = Path.home() / '.health_sleep_sync_lab' / ('session_' + re.sub(r'[^a-zA-Z0-9_]', '_', self.config['serial']) + '.lock')
 
     def verify_root(self):
@@ -99,12 +106,91 @@ class AutomationClient(Client):
             self.script = self.session.create_script(source)
             self.script.load()
             self.script.exports_sync.configure(json.dumps(self.config))
-            self.script.exports_sync.auto_guard()
+            self.guard_reports.append({'process': self.config['process'], 'guard': self.script.exports_sync.auto_guard()})
+            self.guard_other_processes(source)
+            self.enable_process_gate()
+            self.assert_guarded()
+            self.set_quarantine(False)
             self.set_offline(False)
             return self
         except BaseException:
             self.__exit__(None, None, None)
             raise
+
+    def guard_other_processes(self, source):
+        """Protect the main app too before lifting the shared UID firewall."""
+        import frida
+        device = frida.get_device_manager().add_remote_device('127.0.0.1:' + str(self.config['frida_remote_port']))
+        self.spawn_device = device
+        processes = [p for p in device.enumerate_processes() if p.name == self.config['package'] or p.name.startswith(self.config['package'] + ':')]
+        guarded = {self.config['process']}
+        for process in processes:
+            if process.name == self.config['process']:
+                self.guarded_pids.add(process.pid)
+                continue
+            session = device.attach(process.pid)
+            self.extra_sessions.append(session)
+            script = session.create_script(source)
+            script.load()
+            script.exports_sync.configure(json.dumps(self.config))
+            report = script.exports_sync.auto_guard()
+            self.guard_reports.append({'process': process.name, 'guard': report})
+            self.guard_scripts.append(script)
+            self.guarded_pids.add(process.pid)
+            guarded.add(process.name)
+        check(all(p.name in guarded for p in device.enumerate_processes() if
+                  p.name == self.config['package'] or p.name.startswith(self.config['package'] + ':')),
+              'An unguarded app process appeared; networking remains paused')
+
+    def enable_process_gate(self):
+        # New app processes stay suspended. Their Java hooks cannot safely be installed
+        # while Android startup is suspended, so this session stops instead of resuming.
+        self.spawn_device.on('spawn-added', self.on_spawn)
+        self.spawn_device.enable_spawn_gating()
+
+    def on_spawn(self, spawn):
+        name = spawn.identifier or ''
+        if name == self.config['package'] or name.startswith(self.config['package'] + ':'):
+            self.paused_spawns.append({'pid': spawn.pid, 'process': name})
+        else:
+            self.spawn_device.resume(spawn.pid)
+
+    def assert_guarded(self):
+        if self.spawn_device is None:
+            return
+        check(not self.paused_spawns, 'A new app process was paused; session stopped before further requests')
+        processes = self.spawn_device.enumerate_processes()
+        check(all(p.pid in self.guarded_pids for p in processes if p.name == self.config['package'] or
+                  p.name.startswith(self.config['package'] + ':')), 'Unguarded app process; session stopped')
+
+    def guard_state(self):
+        self.assert_guarded()
+        return {'processes': self.guard_reports, 'daemon': self.script.exports_sync.auto_guard_state(),
+                'other_processes': [s.exports_sync.auto_guard_state() for s in self.guard_scripts],
+                'new_process_gate': self.spawn_device is not None, 'paused_spawns': self.paused_spawns}
+
+    def configure(self, **updates):
+        self.assert_guarded()
+        return super().configure(**updates)
+
+    def stats(self):
+        self.assert_guarded()
+        return super().stats()
+
+    def set_quarantine(self, enabled):
+        """Keep the research PC app offline outside controlled sessions, including normal UI starts."""
+        for binary in ['iptables', 'ip6tables']:
+            rule = binary + ' -m owner --uid-owner ' + str(self.uid) + ' -m comment --comment health_panel_quarantine -j REJECT'
+            # Probe existence without interpreting an absent rule as an ADB failure.
+            output = self.adb('shell', "su -c '" + rule.replace(' -m owner', ' -C OUTPUT -m owner', 1) + " >/dev/null 2>&1; echo $?' ")
+            exists = output.strip() == '0'
+            if enabled and not exists:
+                self.adb('shell', "su -c '" + rule.replace(' -m owner', ' -I OUTPUT -m owner', 1) + "'")
+            elif not enabled and exists:
+                self.adb('shell', "su -c '" + rule.replace(' -m owner', ' -D OUTPUT -m owner', 1) + "'")
+            output = self.adb('shell', "su -c '" + rule.replace(' -m owner', ' -C OUTPUT -m owner', 1) + " >/dev/null 2>&1; echo $?' ")
+            check((output.strip() == '0') == enabled, 'PC isolation rule verification failed')
+        self.quarantine_confirmed = enabled
 
     def set_offline(self, enabled):
         if enabled:
@@ -119,47 +205,81 @@ class AutomationClient(Client):
                 self.firewall_rules.remove(binary)
 
     def snapshot(self):
+        self.assert_guarded()
         # stats() returns a Promise in the old adapter; request it separately.
         result = self.script.exports_sync.auto_snapshot()
         result['sleep_stats'] = self.stats()
         return result
 
     def health_read(self, kind, start, end):
+        self.assert_guarded()
         return self.script.exports_sync.auto_health_read(kind, start, end)
 
     def local_sleep(self):
+        self.assert_guarded()
         return self.script.exports_sync.auto_local_sleep()
 
     def upload_health(self, records):
+        self.assert_guarded()
         return self.script.exports_sync.auto_upload_health(json.dumps(records))
 
     def upload_sport(self, records):
+        self.assert_guarded()
         return self.script.exports_sync.auto_upload_sport(json.dumps(records))
 
     def sport_summary(self, value):
+        self.assert_guarded()
         return self.script.exports_sync.auto_upload_sport_summary(json.dumps(value))
 
     def sleep_summary(self, value):
+        self.assert_guarded()
         return self.script.exports_sync.auto_upload_sleep_summary(json.dumps(value))
 
     def delete_sleep(self, start, end):
+        self.assert_guarded()
         return self.script.exports_sync.auto_delete_sleep(start, end)
 
     def clear_local_sleep(self, start, end):
+        self.assert_guarded()
         return self.script.exports_sync.auto_clear_local_sleep(start, end)
+
+    def retire_acknowledged_sleep_deletes(self, start, end):
+        self.assert_guarded()
+        return self.script.exports_sync.auto_retire_acknowledged_sleep_deletes(start, end)
 
     def __exit__(self, *exc):
         try:
             if self.validated:
-                self.adb('shell', 'am', 'force-stop', self.config['package'])
+                try:
+                    self.adb('shell', 'am', 'force-stop', self.config['package'])
+                finally:
+                    self.set_quarantine(True)
         finally:
+            if self.validated and not self.quarantine_confirmed:
+                # If stop/quarantine failed after a connected session, block first.
+                # If even this fails, keep hooks/forward/lock attached for diagnosis.
+                self.set_offline(True)
             try:
-                super().__exit__(*exc)
+                try:
+                    if self.spawn_device is not None:
+                        self.spawn_device.disable_spawn_gating()
+                        self.spawn_device.off('spawn-added', self.on_spawn)
+                    for session in self.extra_sessions:
+                        try:
+                            session.detach()
+                        except Exception:
+                            if self.process_exists():
+                                raise
+                    self.extra_sessions.clear()
+                finally:
+                    super().__exit__(*exc)
             except Exception:
                 if self.process_exists():
                     raise
             finally:
-                self.set_offline(False)
-                if self.lock_owned:
+                # If stop/quarantine failed, retain session firewall and lock.
+                if self.quarantine_confirmed or not self.validated:
+                    self.set_offline(False)
+                if self.lock_owned and self.quarantine_confirmed:
                     self.session_lock.unlink(missing_ok=True)
                     self.lock_owned = False

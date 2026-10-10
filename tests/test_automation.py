@@ -44,10 +44,14 @@ class FakeClient:
     def __init__(self, config):
         self.config = dict(config)
         self.config.update(day_start_ms=BASE, day_end_ms=BASE + 86400000)
+        self.config.setdefault('sleep_query_start_ms', BASE - 43200000)
+        self.config.setdefault('sleep_query_end_ms', BASE + 43200000 - 1)
     def __enter__(self): return self
     def __exit__(self, *args): pass
     def configure(self, **values): self.config.update(values)
     def snapshot(self): return copy.deepcopy(self.state)
+    def guard_state(self): return {'processes': [], 'new_process_gate': True}
+    def stats(self): return copy.deepcopy(self.state['sleep_stats'])
     def local_sleep(self): return copy.deepcopy(self.state.get('local_sleep', {'resultCode': 0, 'intervals': []}))
     def upload_health(self, records):
         type(self).calls += 1
@@ -75,6 +79,11 @@ class FakeClient:
         self.state['sleep_stats']['professionalSleepTotal'] = [copy.deepcopy(value)]
         return {'resultCode': 0}
     def clear_local_sleep(self, start, end): return {'localCleared': True, 'phoneLocalCleared': False}
+    def retire_acknowledged_sleep_deletes(self, start, end):
+        if not self.config.get('sleep_cloud_empty_verified'):
+            raise ValueError('Cloud not empty')
+        self.state['local_sleep'].update(pendingDeletes=[], pendingSummaryDeletes=0, pendingDictionaryDeletes=[])
+        return {'resultCode': 0}
     def delete_sleep(self, start, end):
         self.state['sleep']['detailInfos'] = []
         return {'resultCode': 0}
@@ -159,6 +168,9 @@ class AutomationTests(unittest.TestCase):
         f = fixture()
         FakeClient.state, FakeClient.fail_upload, FakeClient.calls = copy.deepcopy(f), failed, 0
         p = build_plan(f, CONFIG, request, 7)
+        if sleep_authorized:
+            FakeClient.state['sleep']['detailInfos'] = []
+            FakeClient.state['sleep_stats']['professionalSleepTotal'] = []
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'job' / 'plan_private.json'
             save(path, p)
@@ -170,7 +182,7 @@ class AutomationTests(unittest.TestCase):
                     with self.assertRaises(ValueError): execute(path)
                     self.assertEqual(FakeClient.calls, 1)
                     return
-                return execute(path, allow_sleep_delete=sleep_authorized)
+                return execute(path, allow_sleep_delete=sleep_authorized, phone_deleted=sleep_authorized)
 
     def test_failure_never_retries_writes_and_keeps_marker(self):
         self.execute_fixture({'active': 3, 'active_hours': [19]}, failed=True)

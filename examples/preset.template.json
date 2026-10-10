@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "calorie": {"range": [200, 500], "preferred": [250, 400]},
+  "exercise": {"range": [20, 80], "preferred": [35, 55]},
+  "active": {"range": [10, 16], "preferred": [11, 14]},
+  "bedtime": {"range": [0, 90], "preferred": [15, 45]},
+  "wake": {"range": [420, 570], "preferred": [450, 510]},
+  "duration_range": [360, 525],
+  "restore_original_score": true
+}

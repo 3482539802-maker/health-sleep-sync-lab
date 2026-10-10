@@ -31,7 +31,7 @@ def rows(response):
     check(isinstance(response.get('data',{}),dict),'Invalid data map')
     return [row for group in response.get('data',{}).values() for row in group]
 
-def validate(records,start=None,end=None,continuous=True):
+def validate(records,start=None,end=None,continuous=True,allow_wake=False):
     check(isinstance(records,list) and bool(records),'No records')
     ordered=sorted(records,key=lambda r:int(r['startTime']));source=str(ordered[0].get('deviceCode',''))
     check(source not in ['', '0','None'],'Missing source')
@@ -42,7 +42,7 @@ def validate(records,start=None,end=None,continuous=True):
         check(begin%60000==0 and finish-begin==60000,'Only whole one-minute rows supported')
         check(begin not in seen,'Duplicate minute');seen.add(begin)
         points=record.get('samplePoints');check(isinstance(points,list) and len(points)==1,'Exactly one sample point required')
-        point=points[0];check(point['key'] in STAGES,'Unsupported stage: current planner supports shallow/deep/REM only')
+        point=points[0];check(point['key'] in STAGES or (allow_wake and point['key']=='PROFESSIONAL_SLEEP_WAKE'),'Unsupported stage: current planner supports shallow/deep/REM only')
         check(int(point['startTime'])==begin and int(point['endTime'])==finish,'Sample point bounds differ')
     if continuous:check(all(int(a['endTime'])==int(b['startTime']) for a,b in zip(ordered,ordered[1:])),'Gap in target')
     if start is not None:check(int(ordered[0]['startTime'])==start,'Unexpected target start')

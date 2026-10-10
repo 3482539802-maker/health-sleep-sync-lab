@@ -5,6 +5,8 @@ import hashlib
 import json
 import random
 from .model import bounds, check, content, rows, timezone_value, validate
+from .sleep_generation import generated_stages, generated_stages_v1
+from .presets import sample_preset
 
 SHALLOW = 'PROFESSIONAL_SLEEP_SHALLOW'
 DEEP = 'PROFESSIONAL_SLEEP_DEEP'
@@ -52,8 +54,9 @@ def windows(spec):
 
 
 def in_windows(record, base, allowed):
-    minute = (int(record['startTime']) - base) // 60000
-    return any(a <= minute < b for a, b in allowed)
+    minute = (int(record['startTime']) - base) / 60000
+    finish = (int(record['endTime']) - base) / 60000
+    return any(a <= minute < finish <= b for a, b in allowed)
 
 
 def strip_ids(record):
@@ -92,7 +95,7 @@ def allocate(total, weights):
     return result
 
 
-def generated_stages(minutes, rng):
+def legacy_generated_stages(minutes, rng):
     """Stylised cycles, not clinical inference: early deep sleep, later REM."""
     check(240 <= minutes <= 720, 'Generated duration must be 4–12 hours')
     cycles = max(3, round(minutes / 90))
@@ -108,8 +111,11 @@ def generated_stages(minutes, rng):
     return result
 
 
-def sleep_target(snapshot, config, request, rng):
-    original = validate(rows(snapshot['sleep']), continuous=True)
+def sleep_target(snapshot, config, request, rng, sampled_times=None):
+    stage_model = request.get('stage_model')
+    check(stage_model in [None, 'natural_v1', 'natural_v2'], 'Unsupported sleep stage model')
+    natural = stage_model in ['natural_v1', 'natural_v2']
+    original = validate(rows(snapshot['sleep']), continuous=True, allow_wake=natural and request.get('mode') == 'random')
     check(int(original[-1]['endTime']) - int(original[0]['startTime']) <= 86400000, 'Multiple nights are not supported')
     mode = request.get('mode', 'shift')
     base, _ = bounds(config)
@@ -137,10 +143,15 @@ def sleep_target(snapshot, config, request, rng):
             if left <= right:
                 feasible.append((bed, left, right))
         check(bool(feasible), 'Sleep/wake windows and total duration do not overlap')
-        bed, left, right = rng.choice(feasible)
-        wake = rng.randint(left, right)
+        if sampled_times is None:
+            bed, left, right = rng.choice(feasible)
+            wake = rng.randint(left, right)
+        else:
+            bed, wake = sampled_times
+            check(any(b == bed and l <= wake <= r for b, l, r in feasible), 'Preset sleep outside request limits')
         start = base + bed * 60000
-        sequence = generated_stages(wake - bed, rng)
+        generator = {'natural_v1': generated_stages_v1, 'natural_v2': generated_stages}.get(stage_model, legacy_generated_stages)
+        sequence = generator(wake - bed, rng)
     end = start + len(sequence) * 60000
     check(base - 86400000 <= start < end <= base + 86400000, 'Sleep must end on the selected day')
     check(end > base, 'Selected date must be the wake date')
@@ -180,17 +191,60 @@ def build_plan(snapshot, config, request, seed):
     rng = random.Random(seed)
     base, end = bounds(config)
     allowed = windows(request.get('activity_windows', '12:00-14:30,18:00-24:00'))
+    preset = request.get('preset')
+    early_sleep = None
+    if preset:
+        check(request.get('increase_only') is True and request.get('exclude_sleep') is True and
+              request.get('sleep', {}).get('stage_model') in ['natural_v1', 'natural_v2'] and not request.get('steps'),
+              'Preset requires increase-only rings, sleep exclusion and unchanged steps')
+        targets, bed, wake = sample_preset(preset, rng)
+        early_sleep = sleep_target(snapshot, config, request['sleep'], rng, (bed, wake))
+    elif request.get('exclude_sleep') and request.get('sleep'):
+        early_sleep = sleep_target(snapshot, config, request['sleep'], rng)
+    if request.get('exclude_sleep'):
+        exclusions = [(int(r['startTime']), int(r['endTime'])) for r in rows(snapshot['sleep'])]
+        if early_sleep:
+            exclusions.append((early_sleep['target_start'], early_sleep['target_end']))
+        # Subtract entire occupied minutes, including the old sleep kept outside the new target.
+        free = [m for a, b in allowed for m in range(a, b)
+                if not any(base + m * 60000 < y and base + (m + 1) * 60000 > x for x, y in exclusions)]
+        allowed = []
+        for m in sorted(set(free)):
+            if allowed and allowed[-1][1] == m:
+                allowed[-1] = (allowed[-1][0], m + 1)
+            else:
+                allowed.append((m, m + 1))
     stats = snapshot['sport_stats'].get('sportStat') or []
     check(len(stats) == 1 and stats[0].get('sportType') == 0, 'Unique day sport total required')
     stat = copy.deepcopy(stats[0])
     check(int(stat['recordDay']) == int(config['date'].replace('-', '')), 'Sport day differs')
-    targets = {name: choose(request.get(name), rng, low, high) for name, low, high in
-               [('calorie', 0, 10000), ('exercise', 0, 1440), ('steps', 0, 200000), ('active', 0, 24)]}
+    if not preset:
+        targets = {name: choose(request.get(name), rng, low, high) for name, low, high in
+                   [('calorie', 0, 10000), ('exercise', 0, 1440), ('steps', 0, 200000), ('active', 0, 24)]}
+    sampled_targets = copy.deepcopy(targets)
     sport_original = rows(snapshot['sport'])
     check(all(base <= int(r['startTime']) < int(r['endTime']) <= end for r in sport_original), 'Sport records outside selected day')
     working = copy.deepcopy(sport_original)
     hours = active_hours(snapshot, base)
     notices = []
+    skipped = {}
+    current_totals = {'calorie': stat['sportBasicInfo']['calorie'] / 1000,
+                      'steps': stat['sportBasicInfo']['steps'],
+                      'exercise': stat['exerciseTimeBasic']['totalMidHighIntensity'],
+                      'active': stat['activeHourBasic']['countActiveHour']}
+    if request.get('increase_only'):
+        for field in ['calorie', 'exercise', 'active']:
+            if targets[field] is not None and targets[field] <= current_totals[field]:
+                skipped[field] = {'sampled': targets[field], 'original': current_totals[field], 'reason': 'not_above_original'}
+                targets[field] = None
+        if targets['active'] is not None:
+            capacity = len([h for h in range(24) if h not in hours and
+                            any(a <= h * 60 and (h + 1) * 60 <= b for a, b in allowed)])
+            if targets['active'] - current_totals['active'] > capacity:
+                skipped['active'] = {'sampled': targets['active'], 'original': current_totals['active'], 'reason': 'insufficient_awake_hours'}
+                targets['active'] = None
+    for field, detail in skipped.items():
+        notices.append(field + ': skipped (' + detail['reason'] + '); original retained')
     for field, multiplier in [('steps', 1), ('calorie', 1000)]:
         value = targets[field]
         if value is None:
@@ -246,6 +300,9 @@ def build_plan(snapshot, config, request, seed):
         requested_hours = request.get('active_hours', [])
         check(all(isinstance(h, int) and 0 <= h <= 23 for h in requested_hours), 'Invalid active hour')
         missing = sorted(set(requested_hours) - hours)
+        if request.get('exclude_sleep'):
+            check(all(any(a <= h * 60 and (h + 1) * 60 <= b for a, b in allowed) for h in missing),
+                  'Selected active hour overlaps excluded sleep')
         need = targets['active'] - current
         check(len(missing) <= max(0, need), 'More selected hours than target increase')
         possible = [h for h in range(24) if h not in hours and h not in missing and
@@ -267,11 +324,17 @@ def build_plan(snapshot, config, request, seed):
             notices.append('active: existing active hours are retained; lower total may be ignored')
         stat['activeHourBasic']['countActiveHour'] = targets['active']
     stat.update(dataSource=2, deviceCode='0')
-    sleep = sleep_target(snapshot, config, request['sleep'], rng) if request.get('sleep') else None
-    return {'format_version': 2, 'config': copy.deepcopy(config), 'request': copy.deepcopy(request), 'seed': seed,
+    sleep = early_sleep or (sleep_target(snapshot, config, request['sleep'], rng) if request.get('sleep') else None)
+    plan = {'format_version': 2, 'config': copy.deepcopy(config), 'request': copy.deepcopy(request), 'seed': seed,
             'baseline': copy.deepcopy(snapshot), 'baseline_fingerprint': fingerprint(snapshot), 'targets': targets,
             'sport': sport_changes, 'intensity': intensity, 'active': active, 'sport_summary': stat,
             'sleep': sleep, 'notices': notices, 'cloud_and_phone_verification_required': True}
+    if preset or request.get('increase_only'):
+        plan.update(sampled_targets=sampled_targets, skipped=skipped, awake_activity_windows=allowed)
+    if request.get('exclude_sleep'):
+        check(all(in_windows(r, base, allowed) for domain in ['sport', 'intensity', 'active'] for r in plan[domain]),
+              'Generated activity overlaps excluded sleep')
+    return plan
 
 
 def validate_automation_plan(plan):
@@ -286,6 +349,9 @@ def describe(plan):
     result = {'date': plan['config']['date'], 'targets': plan['targets'],
               'sport_minutes_changed': len(plan['sport']), 'exercise_minutes_added': len(plan['intensity']),
               'active_hours_added': len(plan['active']), 'notices': plan['notices']}
+    if 'sampled_targets' in plan:
+        result.update(sampled_targets=plan['sampled_targets'], skipped=plan['skipped'],
+                      awake_activity_windows=plan['awake_activity_windows'])
     if plan['sleep']:
         s = plan['sleep']
         tz = timezone_value(plan['config']['timezone'])
