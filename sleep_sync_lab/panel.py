@@ -159,13 +159,37 @@ class Panel:
         value = filedialog.askopenfilename(title='打开私有计划', filetypes=[('JSON', '*.json')])
         if value:
             try:
-                plan = load(private(value))
-                review = describe(plan)
-                self.plan_path = Path(value)
-                self.delete_confirm.set(False)
-                self.show_review(review)
+                self.restore_plan(value)
             except Exception:
                 messagebox.showerror('计划无效', '该文件未通过计划校验。')
+
+    def restore_plan(self, value):
+        path = private(value)
+        plan = load(path)
+        review = describe(plan)
+        request = plan['request']
+        def formatted(value):
+            return '-'.join(map(str, value)) if isinstance(value, list) else '' if value is None else str(value)
+        self.plan_path = path
+        self.date.set(plan['config']['date'])
+        config_path = path.parent / 'config_private.json'
+        if config_path.exists():
+            self.config_path.set(str(config_path))
+        for key in ['calorie', 'exercise', 'steps', 'active']:
+            self.vars[key].set(formatted(request.get(key)))
+        self.vars['activity_windows'].set(request.get('activity_windows', '12:00-14:30,18:00-24:00'))
+        self.vars['active_hours'].set(','.join(map(str, request.get('active_hours', []))))
+        self.preserve.set(request.get('preserve_active_hours', True))
+        sleep = request.get('sleep') or {}
+        self.sleep_enabled.set(bool(sleep))
+        self.sleep_mode.set(sleep.get('mode', 'shift'))
+        self.restore_score.set(sleep.get('restore_original_score', False))
+        for key, default in [('advance_minutes', 120), ('bedtime_range', ['23:00', '01:00']),
+                             ('wake_range', ['07:00', '09:00']), ('duration_range', [420, 540])]:
+            self.vars[key].set(formatted(sleep.get(key, default)))
+        self.delete_confirm.set(False)
+        self.show_review(review)
+        self.status.set('已恢复保存的计划；修改输入后须重新生成计划。启动不会执行。')
 
     def apply(self):
         if not self.plan_path:
@@ -248,15 +272,7 @@ def main():
     root = tk.Tk()
     panel = Panel(root, args.config, args.runs)
     if args.plan:
-        path = private(args.plan)
-        plan = load(path)
-        panel.plan_path = path
-        panel.date.set(plan['config']['date'])
-        for key in ['calorie', 'exercise', 'steps', 'active']:
-            value = plan['request'].get(key)
-            panel.vars[key].set('-'.join(map(str, value)) if isinstance(value, list) else '' if value is None else str(value))
-        panel.show_review(describe(plan))
-        panel.status.set('已恢复保存的计划；启动不会执行。请查看目标与日期。')
+        panel.restore_plan(args.plan)
     root.mainloop()
 
 

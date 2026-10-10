@@ -7,6 +7,16 @@ class PanelOperationError(ValueError):
         self.user_message = message
 
 
+class AdbOperationError(ValueError):
+    """Raw diagnostics available only to private failure files."""
+    def __init__(self, command, result):
+        super().__init__('ADB operation failed; inspect privately')
+        self.command = command
+        self.returncode = result.returncode
+        self.stdout = result.stdout
+        self.stderr = result.stderr
+
+
 def user_message(error):
     if isinstance(error, PanelOperationError):
         return error.user_message

@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 from .model import bounds,check
+from .errors import AdbOperationError
 
 class Client:
     def __init__(self,config):
@@ -13,7 +14,8 @@ class Client:
         self.config.update(day_start_ms=start,day_end_ms=end,record_day=int(config['date'].replace('-','')))
     def adb(self,*parts):
         result=subprocess.run([self.config['adb'],'-s',self.config['serial'],*parts],capture_output=True,timeout=40)
-        check(result.returncode==0,'ADB operation failed; inspect privately')
+        if result.returncode != 0:
+            raise AdbOperationError(list(parts), result)
         return result.stdout.decode('utf-8','replace').strip()
     def __enter__(self):
         import frida

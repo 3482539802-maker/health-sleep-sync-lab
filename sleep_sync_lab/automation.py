@@ -10,6 +10,7 @@ from .automation_client import AutomationClient
 from .automation_model import build_plan, canonical, describe, fingerprint, validate_automation_plan
 from .model import bounds, check, content, digest, rows
 from .errors import user_message
+from .audit import event, failure_details, runtime_manifest
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 
@@ -29,6 +30,9 @@ def save(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('x', encoding='utf-8') as handle:
         json.dump(value, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        __import__('os').fsync(handle.fileno())
+    event(path.parent, 'artifact_saved', file=path.name, sha256=digest(path))
 
 
 def save_failure(directory, name, value):
@@ -72,7 +76,10 @@ def prepare(config, request, directory, log=lambda message: None):
     save(directory / 'request_private.json', request)
     log('正在隔离启动电脑原版并备份所选日期…')
     try:
+        save_failure(directory, 'prepare_runtime_private.json', runtime_manifest())
+        event(directory, 'prepare_begin')
         with AutomationClient(config) as client:
+            event(directory, 'session_ready', phase='prepare')
             snapshot = snapshot_with_retry(client)
             if request.get('sleep'):
                 snapshot['local_sleep'] = client.local_sleep()
@@ -81,9 +88,11 @@ def prepare(config, request, directory, log=lambda message: None):
         save(directory / 'plan_private.json', plan)
         save(directory / 'review_private.json', describe(plan))
         log('备份和固定计划已保存；尚未修改健康记录。')
+        event(directory, 'prepare_complete', plan_sha256=digest(directory / 'plan_private.json'))
         return directory / 'plan_private.json'
     except Exception as error:
-        save_failure(directory, 'prepare_failure_private.json', {'traceback': traceback.format_exc(), 'message': user_message(error)})
+        save_failure(directory, 'prepare_failure_private.json', {'traceback': traceback.format_exc(), 'message': user_message(error), 'diagnostics': failure_details(error)})
+        event(directory, 'prepare_failed', error_type=type(error).__name__)
         raise
 
 
@@ -132,22 +141,28 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None):
         raise ValueError('Another job or unfinished session lock exists; inspect before proceeding')
     wrote = False
     try:
+        save_failure(directory, 'apply_runtime_private.json', runtime_manifest())
+        event(directory, 'apply_begin', plan_sha256=plan_hash, sleep_delete_authorized=bool(allow_sleep_delete))
         with AutomationClient(plan['config']) as client:
+            event(directory, 'session_ready', phase='apply')
             current = snapshot_with_retry(client)
             if plan['sleep']:
                 current['local_sleep'] = client.local_sleep()
             save(directory / 'before_apply_private.json', current)
             check_baseline(current, plan['baseline'], plan)
             check(digest(plan_path) == plan_hash, 'Plan changed while checking backup')
+            event(directory, 'baseline_verified', plan_sha256=plan_hash)
             save(directory / 'apply_started_private.json', {'plan_sha256': plan_hash,
                  'sleep_delete_authorized': bool(allow_sleep_delete), 'local_time': datetime.now().astimezone().isoformat()})
             wrote = True
 
             def operation(name, fn):
                 save(directory / (name + '_started_private.json'), {'plan_sha256': plan_hash})
+                event(directory, 'operation_begin', operation=name)
                 response = fn()
                 save(directory / (name + '_response_private.json'), response)
                 successful(response)
+                event(directory, 'operation_response_ok', operation=name)
                 return response
 
             client.configure(write_scope={'start': client.config['day_start_ms'], 'end': client.config['day_end_ms']})
@@ -170,6 +185,7 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None):
                         domain_response = after['intensity' if domain == 'intensity' else 'active']
                         actual = {semantic_health(r) for r in rows(domain_response)}
                         check(all(semantic_health(r) in actual for r in items), 'Uploaded health minute/hour not adopted')
+                    event(directory, 'readback_verified', operation=domain + '_' + str(batch), count=len(items))
             if any(v is not None for v in plan['targets'].values()):
                 summary = copy.deepcopy(plan['sport_summary'])
                 now = int(time.time() * 1000)
@@ -185,15 +201,18 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None):
                 client.configure(delete_scope=local_scope)
                 # Clear PC old segments too, rather than leave a known stale upload source.
                 save(directory / 'local_sleep_clear_started_private.json', {'scope': local_scope})
+                event(directory, 'operation_begin', operation='local_sleep_clear', scope=local_scope)
                 local = client.clear_local_sleep(local_scope['start'], local_scope['end'])
                 save(directory / 'local_sleep_clear_response_private.json', local)
                 check(local.get('localCleared') is True, 'PC local sleep deletion not confirmed; cloud not deleted')
+                event(directory, 'local_sleep_clear_verified')
                 client.configure(delete_scope=scope)
                 operation('sleep_delete', lambda: client.delete_sleep(scope['start'], scope['end']))
                 remaining = client.health_read(9, scope['start'], scope['end'])
                 save(directory / 'sleep_after_delete_private.json', remaining)
                 successful(remaining)
                 check(not rows(remaining), 'Old sleep still in cloud; no rebuild')
+                event(directory, 'sleep_cloud_empty_verified')
                 client.configure(write_scope={'start': s['target_start'], 'end': s['target_end']})
                 for batch, offset in enumerate(range(0, len(s['target']), 200)):
                     items = s['target'][offset:offset + 200]
@@ -203,6 +222,7 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None):
                     successful(value)
                     actual = {semantic_health(r) for r in rows(value)}
                     check(all(semantic_health(r) in actual for r in s['target'][:offset + 200]), 'Sleep rebuild incomplete; stop')
+                    event(directory, 'readback_verified', operation='sleep_' + str(batch), rebuilt_count=offset + len(items))
                 total = copy.deepcopy(s['summary'])
                 total['generateTime'] = str(int(time.time() * 1000))
                 operation('sleep_summary', lambda: client.sleep_summary(total))
@@ -227,13 +247,16 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None):
                     totals[0]['professionalSleep'].get(k) == plan['sleep']['summary']['professionalSleep'].get(k)
                     for k in ['allSleepTime', 'lightSleepTime', 'deepSleepTime', 'dreamTime', 'fallAsleepTime', 'wakeupTime', 'sleepScore'])
             save(directory / 'result_private.json', result)
+            event(directory, 'apply_complete', phone_verification_pending=True)
             log('执行已结束；请按结果核对云端采用情况，并在手机正常同步验收。')
             return result
     except Exception as error:
-        save_failure(directory, 'apply_failure_private.json', {'writes_may_have_started': wrote, 'traceback': traceback.format_exc(), 'message': user_message(error)})
+        save_failure(directory, 'apply_failure_private.json', {'writes_may_have_started': wrote, 'traceback': traceback.format_exc(), 'message': user_message(error), 'diagnostics': failure_details(error)})
+        event(directory, 'apply_failed', writes_may_have_started=wrote, error_type=type(error).__name__)
         raise
     finally:
         lock.unlink(missing_ok=True)
+        event(directory, 'job_lock_released')
 
 
 def main():
