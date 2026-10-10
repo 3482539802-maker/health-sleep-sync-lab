@@ -45,6 +45,24 @@ class AutomationClient(Client):
         self.lock_owned = False
         self.session_lock = Path.home() / '.health_sleep_sync_lab' / ('session_' + re.sub(r'[^a-zA-Z0-9_]', '_', self.config['serial']) + '.lock')
 
+    def verify_root(self):
+        # This is a read-only readiness probe, never a retry of a health mutation.
+        from .audit import failure_details
+        failures = []
+        last_error = None
+        for attempt in range(3):
+            try:
+                check(self.adb('shell', 'su', '-c', 'id').startswith('uid=0'), 'PC emulator root required')
+                return
+            except Exception as error:
+                last_error = error
+                failures.append({'attempt': attempt + 1, 'diagnostics': failure_details(error)})
+                if attempt < 2:
+                    time.sleep(.3)
+        error = PanelOperationError('电脑模拟器Root检查未通过，尚未读取备份或写入。请检查模拟器Root和ADB连接；原始输出在私有失败记录中。')
+        error.attempts = failures
+        raise error from last_error
+
     def __enter__(self):
         # Verify PC environment before any stop/start/network mutation.
         check(re.fullmatch(r'emulator-\d+|127\.0\.0\.1:\d+', self.config['serial']) is not None,
@@ -60,7 +78,7 @@ class AutomationClient(Client):
         uid = re.search(r'\buserId=(\d+)', package)
         check(uid is not None, 'Package UID missing')
         self.uid = int(uid.group(1))
-        check(self.adb('shell', 'su', '-c', 'id').startswith('uid=0'), 'PC emulator root required')
+        self.verify_root()
         self.session_lock.parent.mkdir(parents=True, exist_ok=True)
         try:
             with self.session_lock.open('x', encoding='utf-8') as handle:

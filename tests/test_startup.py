@@ -44,6 +44,22 @@ class StartupTests(unittest.TestCase):
             with self.assertRaises(PanelOperationError): client.launch_original()
         self.assertEqual(client.process_exists.call_count, 40)
 
+    def test_root_readiness_retry_does_not_launch_or_write(self):
+        client = self.client()
+        client.adb = Mock(side_effect=[ValueError('ADB operation failed; inspect privately'), 'uid=0(root)'])
+        with patch('sleep_sync_lab.automation_client.time.sleep'):
+            client.verify_root()
+        self.assertEqual(client.adb.call_count, 2)
+        self.assertTrue(all(call.args == ('shell', 'su', '-c', 'id') for call in client.adb.call_args_list))
+
+    def test_root_failure_keeps_all_attempts_and_stops(self):
+        client = self.client()
+        client.adb = Mock(side_effect=ValueError('PC emulator root required'))
+        with patch('sleep_sync_lab.automation_client.time.sleep'):
+            with self.assertRaises(PanelOperationError) as caught: client.verify_root()
+        self.assertEqual(client.adb.call_count, 3)
+        self.assertEqual(len(caught.exception.attempts), 3)
+
     def test_multiple_prewrite_failures_keep_each_diagnostic(self):
         plan = build_plan(fixture(), CONFIG, {'steps': 500}, 5)
         with tempfile.TemporaryDirectory() as folder:

@@ -13,7 +13,7 @@ from sleep_sync_lab.automation_model import build_plan
 from sleep_sync_lab.client import Client
 from sleep_sync_lab.errors import AdbOperationError, PanelOperationError, user_message
 from sleep_sync_lab.model import digest
-from sleep_sync_lab.panel import Panel
+from sleep_sync_lab.panel import Panel, source_is_current
 from test_automation import CONFIG, FakeClient, fixture
 
 
@@ -23,6 +23,11 @@ class Variable:
 
 
 class AuditTests(unittest.TestCase):
+    def test_stale_panel_detects_source_update(self):
+        self.assertTrue(source_is_current())
+        with patch('sleep_sync_lab.panel.source_fingerprints', return_value={'artificial.py': 'changed'}):
+            self.assertFalse(source_is_current())
+
     def test_success_records_runtime_artifact_hashes_and_verified_order(self):
         FakeClient.state, FakeClient.fail_upload = copy.deepcopy(fixture()), False
         with tempfile.TemporaryDirectory() as folder:

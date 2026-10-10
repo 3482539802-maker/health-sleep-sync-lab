@@ -11,6 +11,14 @@ from tkinter import filedialog, messagebox, ttk
 from .automation import execute, load, prepare, private
 from .automation_model import describe
 from .errors import user_message
+from .audit import source_fingerprints
+
+
+LOADED_SOURCE_HASHES = source_fingerprints()
+
+
+def source_is_current():
+    return source_fingerprints() == LOADED_SOURCE_HASHES
 
 
 def numeric(text):
@@ -129,6 +137,10 @@ class Panel:
 
     def task(self, fn):
         if self.busy:
+            return
+        if not source_is_current():
+            self.status.set('程序文件已更新。请关闭面板再重新打开，加载新版后继续。尚未启动本次操作。')
+            messagebox.showinfo('需要重新打开面板', self.status.get())
             return
         self.busy = True
         for button in self.buttons:

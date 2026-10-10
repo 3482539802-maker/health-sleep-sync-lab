@@ -18,10 +18,15 @@ def event(directory, name, **details):
         os.fsync(handle.fileno())
 
 
-def runtime_manifest():
+def source_fingerprints():
     package = Path(__file__).resolve().parent
     sources = sorted(package.glob('*.py')) + sorted(package.glob('*.js'))
-    hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}
+
+
+def runtime_manifest():
+    package = Path(__file__).resolve().parent
+    hashes = source_fingerprints()
     try:
         commit = subprocess.check_output(['git', '-C', str(package.parent), 'rev-parse', 'HEAD'],
                                          stderr=subprocess.DEVNULL, timeout=5).decode().strip()
@@ -38,7 +43,7 @@ def failure_details(error):
     while error is not None and id(error) not in visited:
         visited.add(id(error))
         item = {'type': type(error).__name__}
-        for key in ['command', 'returncode', 'stdout', 'stderr']:
+        for key in ['command', 'returncode', 'stdout', 'stderr', 'attempts']:
             value = getattr(error, key, None)
             if value is not None:
                 item[key] = value.decode('utf-8', 'replace') if isinstance(value, bytes) else value
