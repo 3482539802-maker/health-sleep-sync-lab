@@ -14,6 +14,10 @@ from .errors import user_message
 from .audit import source_fingerprints
 from .presets import preset_request
 from .batch import prepare_batch, describe_batch, execute_batch, selected_dates
+from .input_validation import (InputValidationError, TARGETS, number, hours, time_range,
+                               activity_windows, date_input, validate_config, validate_request)
+from .diagnostics import record_incident
+from .host_process import silence_windows_crash_dialogs
 
 
 def review_saved(path):
@@ -28,13 +32,22 @@ def source_is_current():
 
 
 def numeric(text):
-    text = text.strip()
-    if not text:
-        return None
-    pieces = text.split('-')
-    if len(pieces) == 2:
-        return [int(pieces[0]), int(pieces[1])]
-    return int(text)
+    return number(text.strip(), '数值', -200000, 200000)
+
+
+def read_config(value):
+    if not str(value).strip():
+        raise InputValidationError('私有配置', '', '请先选择仓库外的JSON配置文件')
+    path = private(value)
+    try:
+        config = load(path)
+    except json.JSONDecodeError as error:
+        raise InputValidationError('私有配置', path.name, f'JSON格式有误，第{error.lineno}行第{error.colno}列') from error
+    except OSError as error:
+        raise InputValidationError('私有配置', path.name, '文件无法读取，请检查是否存在及访问权限') from error
+    if not isinstance(config, dict):
+        raise InputValidationError('私有配置', path.name, 'JSON顶层需要对象格式')
+    return config
 
 
 class Panel:
@@ -43,11 +56,20 @@ class Panel:
         self.events = queue.Queue()
         self.busy = False
         self.plan_path = None
+        self.plan_inputs = None
+        self.pending_inputs = None
+        self.field_entries = {}
         self.runs = private(runs or Path.home() / '.health_sleep_sync_lab' / 'runs')
         self.config_path = tk.StringVar(value=str(config_path or ''))
         self.date = tk.StringVar(value=datetime.now().strftime('%Y-%m-%d'))
+        initial_error = None
         if config_path:
-            self.date.set(load(private(config_path))['date'])
+            try:
+                initial = read_config(config_path)
+                date_input(initial.get('date', ''))
+                self.date.set(initial['date'])
+            except Exception as error:
+                initial_error = error
         self.end_date = tk.StringVar(value='')
         self.scheme = tk.StringVar(value='自定义')
         self.vars = {}
@@ -68,12 +90,15 @@ class Panel:
         setup = ttk.Frame(outer)
         setup.pack(fill='x')
         ttk.Label(setup, text='私有配置').grid(row=0, column=0, sticky='w')
-        ttk.Entry(setup, textvariable=self.config_path).grid(row=0, column=1, columnspan=2, sticky='ew', padx=10)
+        self.field_entries['私有配置'] = ttk.Entry(setup, textvariable=self.config_path)
+        self.field_entries['私有配置'].grid(row=0, column=1, columnspan=2, sticky='ew', padx=10)
         ttk.Button(setup, text='选择文件', command=self.choose_config).grid(row=0, column=3)
         ttk.Label(setup, text='日期 / 起床日').grid(row=1, column=0, sticky='w', pady=8)
-        ttk.Entry(setup, textvariable=self.date, width=18).grid(row=1, column=1, sticky='w', padx=10)
+        self.field_entries['日期 / 起床日'] = ttk.Entry(setup, textvariable=self.date, width=18)
+        self.field_entries['日期 / 起床日'].grid(row=1, column=1, sticky='w', padx=10)
         ttk.Label(setup, text='批量截止日期（含当天）').grid(row=1, column=2, sticky='w')
-        ttk.Entry(setup, textvariable=self.end_date, width=18).grid(row=1, column=3, padx=8)
+        self.field_entries['批量截止日期'] = ttk.Entry(setup, textvariable=self.end_date, width=18)
+        self.field_entries['批量截止日期'].grid(row=1, column=3, padx=8)
         ttk.Label(setup, text='生成方案').grid(row=2, column=0, sticky='w')
         self.scheme_box = ttk.Combobox(setup, textvariable=self.scheme, values=['自定义', '默认方案'], state='readonly', width=16)
         self.scheme_box.grid(row=2, column=1, sticky='w', padx=10)
@@ -129,12 +154,19 @@ class Panel:
         self.output.pack(side='left', fill='both', expand=True)
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.poll)
+        for variable in [self.config_path, self.date, self.end_date, self.scheme, self.preserve,
+                         self.sleep_enabled, self.sleep_mode, self.restore_score, *self.vars.values()]:
+            variable.trace_add('write', self.form_changed)
+        if initial_error:
+            root.after(0, lambda error=initial_error: self.display_error(self.incident(error, '加载配置')))
 
     def entry(self, frame, row, name, label, value, width=25, hint=''):
         var = tk.StringVar(value=value)
         self.vars[name] = var
         ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', pady=4)
-        ttk.Entry(frame, textvariable=var, width=width).grid(row=row, column=1, sticky='w', padx=12, pady=4)
+        widget = ttk.Entry(frame, textvariable=var, width=width)
+        widget.grid(row=row, column=1, sticky='w', padx=12, pady=4)
+        self.field_entries[label] = widget
         if hint:
             ttk.Label(frame, text=hint, foreground='#69717d').grid(row=row, column=2, sticky='w')
 
@@ -142,18 +174,72 @@ class Panel:
         value = filedialog.askopenfilename(title='选择仓库外的私有配置', filetypes=[('JSON', '*.json')])
         if value:
             self.config_path.set(value)
-            self.date.set(load(private(value))['date'])
+            try:
+                config = read_config(value)
+                date_input(config.get('date', ''))
+                self.date.set(config['date'])
+                if self.scheme.get() == '默认方案':
+                    self.scheme_changed()
+            except Exception as error:
+                self.display_error(self.incident(error, '选择配置'))
+
+    def form_values(self):
+        return {'config_path': self.config_path.get(), 'date': self.date.get(), 'end_date': self.end_date.get(),
+                'scheme': self.scheme.get(), 'fields': {key: var.get() for key, var in self.vars.items()},
+                'preserve_active_hours': self.preserve.get(), 'sleep_enabled': self.sleep_enabled.get(),
+                'sleep_mode': self.sleep_mode.get(), 'restore_score': self.restore_score.get()}
+
+    def form_changed(self, *args):
+        if self.plan_path:
+            self.delete_confirm.set(False)
+            if not self.busy:
+                self.status.set('输入已改变。请重新生成计划，或重新打开保存的计划后执行。')
+
+    def incident(self, error, phase, directory=None):
+        return record_incident(error, self.runs, phase, self.form_values(), directory)
+
+    def display_error(self, packet):
+        message = packet['phase'] + '失败：\n' + packet['message']
+        if packet.get('evidence'):
+            message += '\n\n失败记录目录：\n' + packet['evidence']
+        self.status.set('操作已停止，具体原因见下方记录及弹窗。')
+        self.output.insert('end', '\n' + message + '\n')
+        self.output.see('end')
+        field = packet.get('field') or ''
+        if field:
+            if not self.parameters_visible:
+                self.toggle_parameters()
+            label = '私有配置' if field.startswith(('私有配置.', 'default_preset.', '默认')) else field
+            entry = next((widget for name, widget in self.field_entries.items() if name.startswith(label)), None)
+            if entry:
+                if entry.master in self.tabs.winfo_children():
+                    self.tabs.select(entry.master)
+                entry.focus_set()
+                entry.selection_range(0, 'end')
+        messagebox.showerror(packet['phase'] + '失败', message, parent=self.root)
+
+    def preset_controls(self):
+        state = 'disabled' if self.scheme.get() == '默认方案' else 'normal'
+        for label, widget in self.field_entries.items():
+            if label not in ['私有配置', '日期 / 起床日', '批量截止日期']:
+                widget.configure(state=state)
+        for pane in self.tabs.winfo_children():
+            for widget in pane.winfo_children():
+                if widget.winfo_class() in ['TCheckbutton', 'TRadiobutton'] and str(widget.cget('variable')) != str(self.restore_score):
+                    widget.configure(state=state)
 
     def scheme_changed(self, event=None):
         self.plan_path = None
+        self.plan_inputs = None
         self.delete_confirm.set(False)
         if not self.parameters_visible:
             self.toggle_parameters()
         if self.scheme.get() != '默认方案':
+            self.preset_controls()
             self.status.set('自定义方案使用输入框；更改参数后重新生成。')
             return
         try:
-            spec = load(private(self.config_path.get()))['default_preset']
+            spec = read_config(self.config_path.get()).get('default_preset')
             request = preset_request(spec)
             for key in ['calorie', 'exercise', 'active']:
                 self.vars[key].set('-'.join(map(str, spec[key]['range'])))
@@ -167,30 +253,35 @@ class Panel:
             for key in ['bedtime_range', 'wake_range', 'duration_range']:
                 self.vars[key].set('-'.join(map(str, request['sleep'][key])))
             self.status.set('默认方案按私有预设加权抽样；输入框显示范围。要编辑范围请切到自定义。')
-        except Exception:
+            self.preset_controls()
+        except Exception as error:
             self.scheme.set('自定义')
-            messagebox.showerror('默认方案未配置', '私有配置中需要有效的 default_preset。')
+            self.preset_controls()
+            self.display_error(self.incident(error, '默认方案配置'))
 
     def request(self):
         if self.scheme.get() == '默认方案':
-            spec = load(private(self.config_path.get()))['default_preset']
+            spec = read_config(self.config_path.get()).get('default_preset')
+            preset_request(spec)
             spec['restore_original_score'] = self.restore_score.get()
             return preset_request(spec)
-        data = {name: numeric(self.vars[name].get()) for name in ['calorie', 'exercise', 'steps', 'active']}
-        data.update(activity_windows=self.vars['activity_windows'].get(), preserve_active_hours=self.preserve.get(),
-                    active_hours=[int(s.strip()) for s in self.vars['active_hours'].get().split(',') if s.strip()])
+        data = {name: number(self.vars[name].get().strip(), *TARGETS[name]) for name in TARGETS}
+        data.update(activity_windows=activity_windows(self.vars['activity_windows'].get()), preserve_active_hours=self.preserve.get(),
+                    active_hours=hours(self.vars['active_hours'].get()))
         if self.sleep_enabled.get():
             s = {'mode': self.sleep_mode.get(), 'restore_original_score': self.restore_score.get()}
             if s['mode'] == 'shift':
-                s['advance_minutes'] = numeric(self.vars['advance_minutes'].get())
+                s['advance_minutes'] = number(self.vars['advance_minutes'].get().strip(), '提前分钟', -720, 720, True)
             else:
-                s.update(bedtime_range=self.vars['bedtime_range'].get().split('-'), wake_range=self.vars['wake_range'].get().split('-'), duration_range=numeric(self.vars['duration_range'].get()), stage_model='natural_v2')
+                def clocks(key, label):
+                    values = time_range(self.vars[key].get(), label)
+                    return [f'{v//60:02}:{v%60:02}' for v in values]
+                s.update(bedtime_range=clocks('bedtime_range', '入睡区间'), wake_range=clocks('wake_range', '醒来区间'),
+                         duration_range=number(self.vars['duration_range'].get().strip(), '总睡眠分钟范围', 240, 720, True), stage_model='natural_v2')
             data['sleep'] = s
-        if not data.get('sleep') and all(data[k] is None for k in ['calorie', 'exercise', 'steps', 'active']):
-            raise ValueError('请至少填写一个修改目标。')
-        return data
+        return validate_request(data)
 
-    def task(self, fn):
+    def task(self, fn, phase='操作', directory=None):
         if self.busy:
             return
         if not source_is_current():
@@ -198,24 +289,33 @@ class Panel:
             messagebox.showinfo('需要重新打开面板', self.status.get())
             return
         self.busy = True
+        inputs = self.form_values()
         for button in self.buttons:
             button.configure(state='disabled')
         def worker():
             try:
                 self.events.put(('done', fn()))
             except Exception as error:
-                self.events.put(('error', user_message(error)))
+                self.events.put(('error', record_incident(error, self.runs, phase, inputs, directory)))
         threading.Thread(target=worker, daemon=False).start()
 
     def prepare(self):
         try:
-            config = load(private(self.config_path.get()))
+            if self.busy:
+                return
+            config = read_config(self.config_path.get())
             config['date'] = self.date.get().strip()
+            date_input(config['date'])
+            validate_config(config)
             # Recompute overnight window when the panel date changes.
             config.pop('sleep_query_start_ms', None)
             config.pop('sleep_query_end_ms', None)
             request = self.request()
             end = self.end_date.get().strip() or config['date']
+            end_day = date_input(end, '批量截止日期')
+            first_day = date_input(config['date'])
+            if end_day < first_day or (end_day - first_day).days >= 31:
+                raise InputValidationError('批量截止日期', end, f'不得早于开始日期{config["date"]}，一次最多31天')
             dates = selected_dates(config['date'], end)
             if len(dates) > 1 and not request.get('preset'):
                 messagebox.showerror('批量方案', '日期区间批量目前仅支持默认方案。')
@@ -223,19 +323,20 @@ class Panel:
             directory = self.runs / datetime.now().strftime('%Y%m%d_%H%M%S_%f')
             self.plan_path = None
             self.delete_confirm.set(False)
+            self.pending_inputs = self.form_values()
             log = lambda s: self.events.put(('log', s))
             self.task(lambda: ('plan', prepare_batch(config, request, config['date'], end, directory, log)
-                                   if len(dates) > 1 else prepare(config, request, directory, log)))
-        except (ValueError, OSError, KeyError):
-            messagebox.showerror('无法生成计划', '请核对私有配置、日期、数值与时间区间。')
+                                   if len(dates) > 1 else prepare(config, request, directory, log)), '生成计划', directory)
+        except Exception as error:
+            self.display_error(self.incident(error, '生成计划输入检查'))
 
     def open_plan(self):
         value = filedialog.askopenfilename(title='打开私有计划', filetypes=[('JSON', '*.json')])
         if value:
             try:
                 self.restore_plan(value)
-            except Exception:
-                messagebox.showerror('计划无效', '该文件未通过计划校验。')
+            except Exception as error:
+                self.display_error(self.incident(error, '打开保存的计划'))
 
     def restore_plan(self, value):
         path = private(value)
@@ -272,12 +373,25 @@ class Panel:
         self.delete_confirm.set(False)
         self.show_review(review)
         self.status.set('已恢复保存的计划；修改输入后须重新生成计划。启动不会执行。')
+        if hasattr(self, 'end_date'):
+            self.preset_controls()
+            self.plan_inputs = self.form_values()
 
     def apply(self):
         if not self.plan_path:
             messagebox.showinfo('尚无计划', '先生成或打开计划，查看日期和目标。')
             return
-        plan = load(self.plan_path)
+        if self.busy:
+            return
+        if self.plan_inputs is None or self.form_values() != self.plan_inputs:
+            messagebox.showinfo('输入已变化', '当前输入与保存的计划不同。请重新生成，或重新打开保存的计划恢复输入；本次未执行。', parent=self.root)
+            return
+        try:
+            plan = load(self.plan_path)
+            review_saved(self.plan_path)
+        except Exception as error:
+            self.display_error(self.incident(error, '执行前计划检查', self.plan_path.parent))
+            return
         batch = bool(plan.get('batch_format_version'))
         if (batch or plan['sleep']) and not self.delete_confirm.get():
             messagebox.showinfo('需要手机先清理旧睡眠', '先保存并核对计划，在手机原版“睡眠→所有数据”仅删除计划所选各晚，完成正常同步后勾选。程序还会验证云端分段及汇总为空；不会自动删除其他日期。')
@@ -286,7 +400,7 @@ class Panel:
         confirmed = self.delete_confirm.get()
         log = lambda s: self.events.put(('log', s))
         self.task(lambda: ('result', execute_batch(plan_path, confirmed, log, phone_deleted=confirmed) if batch else
-                          execute(plan_path, allow_sleep_delete=confirmed, log=log, phone_deleted=confirmed)))
+                          execute(plan_path, allow_sleep_delete=confirmed, log=log, phone_deleted=confirmed)), '执行计划', plan_path.parent)
 
     def show_review(self, value):
         if hasattr(self, 'tabs') and self.parameters_visible:
@@ -345,11 +459,12 @@ class Panel:
                 for button in self.buttons:
                     button.configure(state='normal')
                 if kind == 'error':
-                    self.status.set(value)
+                    self.display_error(value)
                 elif value[0] == 'plan':
                     self.plan_path = value[1]
+                    self.plan_inputs = self.pending_inputs
                     self.show_review(review_saved(self.plan_path))
-                    self.status.set('计划已生成并固定随机值，核对后可执行。')
+                    self.status.set('计划已生成并固定随机值，核对后可执行。' if self.form_values() == self.plan_inputs else '生成期间输入发生变化，请重新生成或打开保存计划后执行。')
                 else:
                     result = value[1]
                     if result.get('batch'):
@@ -377,16 +492,35 @@ class Panel:
 
 
 def main():
+    silence_windows_crash_dialogs()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config')
     parser.add_argument('--runs')
     parser.add_argument('--plan', help='Resume a saved private plan without executing it')
     args = parser.parse_args()
-    root = tk.Tk()
-    panel = Panel(root, args.config, args.runs)
-    if args.plan:
-        panel.restore_plan(args.plan)
-    root.mainloop()
+    root = None
+    try:
+        root = tk.Tk()
+        panel = Panel(root, args.config, args.runs)
+        root.report_callback_exception = lambda kind, error, trace: panel.display_error(panel.incident(error, '界面操作'))
+        if args.plan:
+            try:
+                panel.restore_plan(args.plan)
+            except Exception as error:
+                panel.display_error(panel.incident(error, '启动时打开计划'))
+        root.mainloop()
+    except Exception as error:
+        packet = record_incident(error, Path.home() / '.health_sleep_sync_lab' / 'runs', '启动面板',
+                                 {'config_path': args.config, 'runs': args.runs, 'plan': args.plan})
+        text = packet['message'] + ('\n\n失败记录目录：\n' + packet['evidence'] if packet.get('evidence') else '')
+        if root is not None:
+            messagebox.showerror('面板启动失败', text, parent=root)
+            root.destroy()
+        elif os.name == 'nt':
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, text, '面板启动失败', 0x10)
+        else:
+            __import__('sys').stderr.write(text + '\n')
 
 
 if __name__ == '__main__':

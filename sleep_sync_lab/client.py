@@ -3,9 +3,8 @@ from importlib.resources import files
 import json
 from pathlib import Path
 import re
-import subprocess
 from .model import bounds,check
-from .errors import AdbOperationError
+from .host_process import run_adb
 
 class Client:
     def __init__(self,config):
@@ -13,9 +12,7 @@ class Client:
         start,end=bounds(config)
         self.config.update(day_start_ms=start,day_end_ms=end,record_day=int(config['date'].replace('-','')))
     def adb(self,*parts):
-        result=subprocess.run([self.config['adb'],'-s',self.config['serial'],*parts],capture_output=True,timeout=40)
-        if result.returncode != 0:
-            raise AdbOperationError(list(parts), result)
+        result=run_adb(self.config['adb'], parts, self.config['serial'])
         return result.stdout.decode('utf-8','replace').strip()
     def __enter__(self):
         import frida

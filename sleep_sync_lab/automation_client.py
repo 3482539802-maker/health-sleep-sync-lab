@@ -1,20 +1,26 @@
 """Offline startup, temporary PC write guard, bounded native requests, stopped exit."""
 import json
 import re
-import subprocess
 import time
 from pathlib import Path
 from importlib.resources import files
 from .client import Client
 from .model import check
-from .errors import PanelOperationError
+from .errors import PanelOperationError, AdbOperationError, AdbLaunchError
+from .host_process import run_adb
 
 
 class AutomationClient(Client):
     def process_exists(self):
-        result = subprocess.run([self.config['adb'], '-s', self.config['serial'], 'shell', 'pidof',
-                                 self.config['process']], capture_output=True, timeout=40)
+        result = run_adb(self.config['adb'], ['shell', 'pidof', self.config['process']], self.config['serial'])
         return bool(result.stdout.strip())
+
+    def verify_adb(self):
+        result = run_adb(self.config['adb'], ['version'], timeout=10)
+        if b'Android Debug Bridge version' not in result.stdout:
+            error = PanelOperationError('配置的ADB程序未返回正确版本信息。请在私有配置的 adb 字段选择可用的ADB。')
+            error.command, error.stdout, error.stderr = ['version'], result.stdout, result.stderr
+            raise error
 
     def launch_original(self):
         """Launch the resolved original activity directly, never generate monkey events."""
@@ -26,7 +32,11 @@ class AutomationClient(Client):
                           if re.fullmatch(r'com\.huawei\.health/[A-Za-z0-9_.$]+', line.strip())]
             if len(components) != 1:
                 raise PanelOperationError('未找到电脑原版运动健康的启动入口，尚未写入。')
-            self.adb('shell', 'am', 'start', '-W', '-n', components[0])
+            output = self.adb('shell', 'am', 'start', '-W', '-n', components[0])
+            if re.search(r'(?im)^\s*(Error:|Exception|Status:\s*(?:error|timeout))', output):
+                error = PanelOperationError('电脑原版启动命令报告失败，未进入健康操作。请检查应用安装和模拟器状态；原输出见私有记录。')
+                error.command, error.stdout = ['shell', 'am', 'start'], output
+                raise error
         except PanelOperationError:
             raise
         except Exception as error:
@@ -64,6 +74,8 @@ class AutomationClient(Client):
             except Exception as error:
                 last_error = error
                 failures.append({'attempt': attempt + 1, 'diagnostics': failure_details(error)})
+                if isinstance(error, AdbLaunchError) or (isinstance(error, AdbOperationError) and (error.returncode & 0xffffffff) >= 0x80000000):
+                    break
                 if attempt < 2:
                     time.sleep(.3)
         error = PanelOperationError('电脑模拟器Root检查未通过，尚未读取备份或写入。请检查模拟器Root和ADB连接；原始输出在私有失败记录中。')
@@ -72,6 +84,7 @@ class AutomationClient(Client):
 
     def __enter__(self):
         # Verify PC environment before any stop/start/network mutation.
+        self.verify_adb()
         check(re.fullmatch(r'emulator-\d+|127\.0\.0\.1:\d+', self.config['serial']) is not None,
               'Only the configured PC emulator is supported')
         check(self.config.get('emulator_verified') is True, 'PC emulator verification required')

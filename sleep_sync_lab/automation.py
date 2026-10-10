@@ -8,9 +8,10 @@ import time
 import traceback
 from .automation_client import AutomationClient
 from .automation_model import build_plan, canonical, describe, fingerprint, validate_automation_plan
-from .model import bounds, check, content, digest, rows
+from .model import bounds, check, content, digest, rows, timezone_value
 from .errors import user_message
 from .audit import event, failure_details, runtime_manifest
+from .input_validation import validate_request, date_input, InputValidationError
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 
@@ -49,6 +50,11 @@ def successful(value):
 
 def settings(config):
     config = copy.deepcopy(config)
+    date_input(config.get('date', ''))
+    try:
+        timezone_value(config.get('timezone'))
+    except (ValueError, TypeError):
+        raise InputValidationError('私有配置.timezone', config.get('timezone', ''), '请填写带正负号的HH:MM时区') from None
     start, end = bounds(config)
     config.setdefault('transport_class', 'lvv')
     config.setdefault('gson_factory_class', 'oxm')
@@ -71,11 +77,12 @@ def snapshot_with_retry(client):
 def prepare(config, request, directory, log=lambda message: None):
     directory = private(directory)
     directory.mkdir(parents=True, exist_ok=False)
-    config = settings(config)
-    save(directory / 'config_private.json', config)
-    save(directory / 'request_private.json', request)
-    log('正在隔离启动电脑原版并备份所选日期…')
     try:
+        save(directory / 'request_private.json', request)
+        validate_request(request)
+        config = settings(config)
+        save(directory / 'config_private.json', config)
+        log('输入检查通过，正在检查ADB并隔离启动电脑原版…')
         save_failure(directory, 'prepare_runtime_private.json', runtime_manifest())
         event(directory, 'prepare_begin')
         with AutomationClient(config) as client:

@@ -48,7 +48,7 @@ class AuditTests(unittest.TestCase):
 
     def test_adb_details_survive_safe_wrapping_and_private_failure(self):
         response = subprocess.CompletedProcess([], 1, b'FAKE_STDOUT', b'FAKE_STDERR')
-        with patch('sleep_sync_lab.client.subprocess.run', return_value=response):
+        with patch('sleep_sync_lab.host_process.subprocess.run', return_value=response):
             with self.assertRaises(AdbOperationError) as caught:
                 Client(dict(CONFIG, adb='fake', serial='emulator-1234')).adb('shell', 'am', 'start')
         native = caught.exception

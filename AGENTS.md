@@ -12,6 +12,6 @@
 
 每次变更记录问题、修改、测试和限制。运行证据用events_private.jsonl、runtime源码哈希、每批响应／读回及result／failure。云采用、用户可用反馈、手机显示和长期稳定性分别记录，不夸大结果。
 
-验证：python -m unittest discover -s tests -v；变更JS时用node --check对应文件；限定清理事务另用node tests/native_sleep_cleanup.js人工SQLite验证。当前最近完整测试68项通过。仅文档变更校验链接／内容／隐私即可，不执行真实健康写入。
+验证：python -m unittest discover -s tests -v；变更JS时用node --check对应文件；限定清理事务另用node tests/native_sleep_cleanup.js人工SQLite验证。当前最近完整测试85项通过。仅文档变更校验链接／内容／隐私即可，不执行真实健康写入。
 
 睡眠执行以docs/SLEEP_RECURRENCE.md为准：保存完整计划后，用户在手机原版仅删所选晚并正常同步；验证云分段及汇总空、运动基线一致，清电脑旧源／已完成删除队列／旧时间字典，真实读回空后才重建。不再自动删云后立即重建。主进程与后台都guard，新增健康进程保持暂停；退出保留当前模拟器运行期间UID隔离，不将短期核验当长期稳定。诊断启动曾发生非预期后台删除，报告不能称该轮完全只读无副作用。全部旧started与失败任务保留，新恢复任务注明完整备份来源。

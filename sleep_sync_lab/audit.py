@@ -43,7 +43,7 @@ def failure_details(error):
     while error is not None and id(error) not in visited:
         visited.add(id(error))
         item = {'type': type(error).__name__}
-        for key in ['command', 'returncode', 'stdout', 'stderr', 'attempts']:
+        for key in ['command', 'returncode', 'stdout', 'stderr', 'attempts', 'winerror', 'errno', 'timeout', 'field', 'value']:
             value = getattr(error, key, None)
             if value is not None:
                 item[key] = value.decode('utf-8', 'replace') if isinstance(value, bytes) else value

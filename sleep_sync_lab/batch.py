@@ -11,12 +11,13 @@ from .automation_model import build_plan, describe, canonical, validate_automati
 from .audit import event, failure_details, runtime_manifest
 from .errors import user_message
 from .model import check, digest
+from .input_validation import validate_request, date_input, InputValidationError
 
 
 def selected_dates(start, end):
-    first, last = date.fromisoformat(start), date.fromisoformat(end)
-    check(first <= last, 'Batch end precedes start')
-    check((last - first).days < 31, 'Batch supports at most 31 reviewed days')
+    first, last = date_input(start), date_input(end, '批量截止日期')
+    if last < first or (last - first).days >= 31:
+        raise InputValidationError('批量截止日期', end, f'不得早于开始日期{start}，一次最多31天')
     return [(first + timedelta(days=i)).isoformat() for i in range((last - first).days + 1)]
 
 
@@ -34,6 +35,7 @@ def derived_seed(seed, day, attempt=0):
 
 
 def prepare_batch(config, request, start, end, directory, log=lambda message: None):
+    validate_request(request)
     dates = selected_dates(start, end)
     check(bool(request.get('preset')), 'Batch requires a configurable default preset')
     directory = private(directory)

@@ -2,9 +2,11 @@
 import copy
 from .model import check
 from .sleep_generation import weighted_integer
+from .input_validation import validate_preset
 
 
 def preset_request(spec):
+    validate_preset(spec)
     check(spec.get('version') == 1, 'Unsupported preset version')
     for field in ['calorie', 'exercise', 'active', 'bedtime', 'wake']:
         check(field in spec, 'Incomplete preset')
