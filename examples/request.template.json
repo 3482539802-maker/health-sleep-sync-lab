@@ -1,0 +1,16 @@
+{
+  "calorie": [300, 500],
+  "exercise": [40, 60],
+  "steps": [8000, 16000],
+  "active": null,
+  "active_hours": [],
+  "preserve_active_hours": true,
+  "activity_windows": "12:00-14:30,18:00-24:00",
+  "sleep": {
+    "mode": "random",
+    "bedtime_range": ["23:00", "01:00"],
+    "wake_range": ["07:00", "09:00"],
+    "duration_range": [420, 540],
+    "restore_original_score": false
+  }
+}
