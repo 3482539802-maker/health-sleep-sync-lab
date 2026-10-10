@@ -26,7 +26,7 @@
 | sleep_sync_lab/audit.py、errors.py | 私有时间线、运行环境／源码哈希、异常链、ADB诊断与安全提示 |
 | sleep_sync_lab/host_process.py、input_validation.py、diagnostics.py | Windows无控制台ADB、字段预检、启动／界面／任务私有失败记录 |
 | sleep_sync_lab/model.py、__main__.py | 旧单日补段／评分工具及CLI，不能套用面板format_version=2计划 |
-| tests/test_automation.py、test_model.py、test_startup.py、test_audit.py、test_natural_batch.py、test_recurrence.py | 人工数据验证，当前85项通过；native_sleep_cleanup.js验证实际JS限定事务与回滚 |
+| tests/test_automation.py、test_model.py、test_startup.py、test_audit.py、test_natural_batch.py、test_recurrence.py | 人工数据验证，当前89项通过；native_sleep_cleanup.js验证实际JS限定事务与回滚 |
 | examples、docs、run_panel.cmd | 合成模板、说明与公开启动入口 |
 
 ## 必须保留的行为
@@ -52,4 +52,4 @@ prepare读取备份和生成固定计划，不写健康；review校验预览；a
 
 ## 自然睡眠与默认批量更新
 
-新请求使用natural_v2，允许少量3–9分钟阶段，降低超过50分钟连续块的频率，保持底层V1各阶段总分钟和总时长。V1及legacy旧计划仍用原生成器。新增私有加权预设、三环只增、步数默认不改、旧／新睡眠排除和独立逐日批量清单；全日写前核验、逐日哈希及started、失败停止。批量睡眠须先手机清理所选各晚。85项人工测试通过。多日真实写入与持续手机验收仍待验证。详见[NATURAL_SLEEP_AND_BATCH](NATURAL_SLEEP_AND_BATCH.md)。
+新请求使用natural_v2，允许少量3–9分钟阶段，降低超过50分钟连续块的频率，保持底层V1各阶段总分钟和总时长。V1及legacy旧计划仍用原生成器。新增私有加权预设、三环只增、步数默认不改、旧／新睡眠排除和独立逐日批量清单；全日写前核验、逐日哈希及started、失败停止。批量睡眠须先手机清理所选各晚。89项人工测试通过。多日真实写入与持续手机验收仍待验证。详见[NATURAL_SLEEP_AND_BATCH](NATURAL_SLEEP_AND_BATCH.md)。

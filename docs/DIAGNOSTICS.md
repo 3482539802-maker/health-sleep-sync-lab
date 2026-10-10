@@ -10,6 +10,8 @@ ADB失败会显示具体步骤、十六进制系统码或命令返回码，并�
 
 失败弹窗与结果区同时保存提示，显示私有失败目录。生成前、界面回调、异步任务和启动时打开计划失败都有私有诊断；包含输入快照、异常链、原始ADB输出和源码版本。未知底层异常不直接显示原始payload，文件权限／空间不足导致诊断保存失败也会明确提示。打开窗口不会自行生成或执行计划。
 
+生成阶段保存prepare_session_guard_private.json，执行阶段保存apply_session_guard_private.json；旧session_guard_private.json保留兼容。执行前失败再连接时，保护记录和before_apply快照使用新文件，不能与前次记录冲突。仅日志／连接错误且没有apply_started的任务可在修复后再次通过原计划基线核验；已有started仍禁止重跑。手机已删除所选晚时应保留并打开原计划，不从空记录重新生成。
+
 验证使用人工测试模拟Windows系统码、超时、offline、错误输入和编辑后误执行；另有实际Tk／pythonw准备检查。一次成功及短时探测正常不证明间歇性Windows故障永不再发。
 
 [面板用法](AUTOMATION.md) · [故障处理](TROUBLESHOOTING.md)。

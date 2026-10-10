@@ -87,7 +87,7 @@ def prepare(config, request, directory, log=lambda message: None):
         event(directory, 'prepare_begin')
         with AutomationClient(config) as client:
             event(directory, 'session_ready', phase='prepare')
-            save(directory / 'session_guard_private.json', client.guard_state())
+            save(directory / 'prepare_session_guard_private.json', client.guard_state())
             snapshot = snapshot_with_retry(client)
             if request.get('sleep'):
                 snapshot['local_sleep'] = client.local_sleep()
@@ -160,11 +160,13 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None, phone
         event(directory, 'apply_begin', plan_sha256=plan_hash, sleep_delete_authorized=bool(allow_sleep_delete))
         with AutomationClient(plan['config']) as client:
             event(directory, 'session_ready', phase='apply')
-            save(directory / 'session_guard_private.json', client.guard_state())
+            # Preparation, old task evidence and each pre-write attempt are immutable.
+            # Retrying a connection/baseline failure must not overwrite or collide.
+            save_failure(directory, 'apply_session_guard_private.json', client.guard_state())
             current = snapshot_with_retry(client)
             if plan['sleep']:
                 current['local_sleep'] = client.local_sleep()
-            save(directory / 'before_apply_private.json', current)
+            save_failure(directory, 'before_apply_private.json', current)
             check_baseline(current, plan['baseline'], plan, phone_deleted=phone_deleted)
             check(digest(plan_path) == plan_hash, 'Plan changed while checking backup')
             event(directory, 'baseline_verified', plan_sha256=plan_hash)

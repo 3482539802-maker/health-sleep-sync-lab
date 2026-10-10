@@ -68,6 +68,8 @@ def adb_message(error):
 
 
 def user_message(error):
+    if isinstance(error, FileExistsError):
+        return '保存操作记录时发现同名文件，已停止以保留原证据。请查看失败记录定位冲突；不要删除计划、日志或写入标记。'
     # A safe wrapper must not hide an actionable Windows launch/connection code.
     current, seen = error, set()
     while current is not None and id(current) not in seen:
