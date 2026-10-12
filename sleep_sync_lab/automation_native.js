@@ -23,6 +23,44 @@ function autoHealth(type,start,end){
  return encoded(gson,transport.d.overload('com.huawei.hwcloudmodel.healthdatacloud.model.GetHealthDataByTimeReq').call(transport,q));
 }
 Object.assign(rpc.exports,{
+ autoUploadSource(){return autoRun(()=>{
+  const user=use('kyz').a().d(),manager=use('lbk').c(),ids=manager.h(user),sources=[];
+  const needSleep=config.upload_require_sleep_source===true;
+  let ProductMap=null,ProductInfo=null;
+  if(needSleep){ProductMap=Java.use('com.huawei.hihealth.dictionary.constants.ProductMap');ProductInfo=Java.use('com.huawei.hihealth.dictionary.constants.ProductMapInfo');}
+  for(let i=0;i<ids.size();i++){
+   const ctx=manager.g(Number(String(ids.get(i))));if(!ctx)continue;
+   const code=String(ctx.c()),app=use('lbc').a().c(ctx.d());
+   if(!/^[1-9][0-9]*$/.test(code)||!app||String(app.getPackageName())!==config.package)continue;
+   const appType=Number(use('lox').e(String(app.getPackageName())));
+   const device=use('lbt').e().a(ctx.g());
+   const phone=Boolean(device&&String(device.getDeviceUniqueCode())==='-1');
+   let deviceType=null,deviceCategory=null;
+   if(needSleep&&device){
+    deviceType=Number(device.getDeviceType());
+    const maps=ProductMap.b('deviceId',String(deviceType));
+    if(maps&&maps.size())deviceCategory=parseInt(String(Java.cast(maps.get(0),ProductInfo).b()),16);
+   }
+   if(Number.isSafeInteger(appType)&&appType>0)sources.push({deviceCode:code,appType,phone,deviceType,deviceCategory});
+  }
+  const requested=config.upload_device_code;
+  let eligible=requested?sources.filter(s=>s.deviceCode===String(requested)):sources.filter(s=>s.phone);
+  if(!requested&&!eligible.length)eligible=sources;
+  const unique=[...new Map(eligible.map(s=>[s.deviceCode,s])).values()];
+  if(unique.length!==1)throw new Error('Registered upload source unavailable or ambiguous; select registered upload_device_code');
+  const result={resultCode:0,deviceCode:unique[0].deviceCode,appType:unique[0].appType};
+  if(needSleep){
+   const wanted=config.sleep_upload_device_code;
+   // Native phone types cannot provide the wearable scientific-sleep identity.
+   let sleep=sources.filter(s=>!s.phone&&![1,32].includes(s.deviceType)&&Number.isSafeInteger(s.deviceCategory)&&s.deviceCategory>0);
+   if(wanted)sleep=sleep.filter(s=>s.deviceCode===String(wanted));
+   const registered=[...new Map(sleep.map(s=>[s.deviceCode,s])).values()];
+   if(registered.length!==1)throw new Error('Registered sleep device unavailable or ambiguous');
+   result.sleepSource={deviceCode:registered[0].deviceCode,appType:registered[0].appType,
+    deviceCategory:registered[0].deviceCategory,sourceKind:'registered_wearable'};
+  }
+  return result;
+ });},
  autoGuard(){return autoRun(()=>{
   // ART can inline calls compiled before attachment; hooks alone are insufficient.
   Java.deoptimizeEverything();
@@ -92,10 +130,32 @@ Object.assign(rpc.exports,{
    }catch(e){reject(new Error(String(e)));}finally{if(db)db.$dispose();}}
   });
  }));},
+ autoInspectSleepSources(){return autoRun(()=>new Promise((resolve,reject)=>{
+  let db=null;Java.choose('net.zetetic.database.sqlcipher.SQLiteDatabase',{
+   onMatch(x){if(db===null&&x.isOpen()&&String(x.getPath()).endsWith('/hihealth_003.db'))db=Java.retain(x);},
+   onComplete(){try{
+    if(!db)throw new Error('Original local database unavailable');
+    const start=config.sleep_query_start_ms,end=config.sleep_query_end_ms,day=config.record_day;
+    if(![start,end,day].every(Number.isSafeInteger))throw new Error('Selected sleep scope unavailable');
+    const conditions={
+     core:'SELECT COUNT(*) FROM sample_session_core WHERE start_time<='+end+' AND end_time>='+start+' AND type_id BETWEEN 22000 AND 22199',
+     stats:'SELECT COUNT(*) FROM hihealth_stat_day WHERE date='+day+' AND stat_type BETWEEN 44100 AND 44299',
+     dictionary:'SELECT COUNT(*) FROM sample_point_health WHERE start_time<='+end+' AND end_time>='+start+' AND type_id IN ('+autoSleepDictionaryTypes().join(',')+')',
+     syncCache:'SELECT COUNT(*) FROM sync_cache WHERE dataTime>='+start+' AND dataTime<='+end};
+    const counts={};
+    for(const [name,sql] of Object.entries(conditions)){
+     const c=db.rawQuery.overload('java.lang.String','[Ljava.lang.String;').call(db,sql,Java.array('java.lang.String',[]));
+     try{if(!c.moveToFirst())throw new Error('Source inspection incomplete');counts[name]=Number(c.getLong(0));}finally{c.close();}
+    }
+    resolve({resultCode:0,counts,scope:{start,end,day}});
+   }catch(e){reject(new Error(String(e)));}finally{if(db)db.$dispose();}}
+  });
+ }));},
  autoUploadHealth(input){return autoRun(()=>{
   const data=JSON.parse(input);if(!data.length||data.length>200)throw new Error('Health batch limit');
   const {gson,L}=autoCtx(),C=Java.use('com.huawei.hwcloudmodel.model.unite.HealthDetail'),list=Java.use('java.util.ArrayList').$new();
   for(const r of data){
+   if(!/^[1-9][0-9]*$/.test(String(r.deviceCode)))throw new Error('Unresolved health upload source');
    if(![9,12,200005].includes(Number(r.type)))throw new Error('Unsupported health type');
    const start=Number(r.startTime),end=Number(r.endTime);
    const scope=config.write_scope;if(!scope||start<scope.start||end>scope.end||end<=start)throw new Error('Health interval outside reviewed plan');
@@ -108,7 +168,7 @@ Object.assign(rpc.exports,{
  autoUploadSport(input){return autoRun(()=>{
   const data=JSON.parse(input);if(!data.length||data.length>30)throw new Error('Sport batch limit');
   const {gson}=autoCtx(),C=Java.use('com.huawei.hwcloudmodel.model.unite.SportDetail'),list=Java.use('java.util.ArrayList').$new();
-  for(const r of data){if(Number(r.startTime)<config.day_start_ms||Number(r.endTime)>config.day_end_ms||Number(r.endTime)-Number(r.startTime)!==60000)throw new Error('Sport day scope');list.add(gson.fromJson.overload('java.lang.String','java.lang.Class').call(gson,JSON.stringify(r),C.class));}
+  for(const r of data){if(!/^[1-9][0-9]*$/.test(String(r.deviceCode)))throw new Error('Unresolved sport upload source');if(Number(r.startTime)<config.day_start_ms||Number(r.endTime)>config.day_end_ms||Number(r.endTime)-Number(r.startTime)!==60000)throw new Error('Sport day scope');list.add(gson.fromJson.overload('java.lang.String','java.lang.Class').call(gson,JSON.stringify(r),C.class));}
   const R=Java.use('com.huawei.hwcloudmodel.healthdatacloud.model.AddSportDataReq'),q=R.$new();q.setDetailInfo(list);q.setTimeZone(data[0].timeZone);return autoPost('c','AddSportDataReq',q);
  });},
  autoUploadSportSummary(input){return autoRun(()=>{

@@ -43,6 +43,8 @@ def clock(value):
 
 
 def windows(spec):
+    if spec is None or not str(spec).strip():
+        return [(0, 1440)]
     result = []
     for value in spec.split(','):
         a, b = value.strip().split('-')
@@ -111,19 +113,36 @@ def legacy_generated_stages(minutes, rng):
     return result
 
 
-def sleep_target(snapshot, config, request, rng, sampled_times=None):
+def sleep_target(snapshot, config, request, rng, sampled_times=None, frozen=None):
     stage_model = request.get('stage_model')
     check(stage_model in [None, 'natural_v1', 'natural_v2'], 'Unsupported sleep stage model')
     natural = stage_model in ['natural_v1', 'natural_v2']
-    original = validate(rows(snapshot['sleep']), continuous=True, allow_wake=natural and request.get('mode') == 'random')
-    check(int(original[-1]['endTime']) - int(original[0]['startTime']) <= 86400000, 'Multiple nights are not supported')
     mode = request.get('mode', 'shift')
     base, _ = bounds(config)
+    source_rows = rows(snapshot['sleep'])
+    empty_original = not source_rows and frozen is not None and mode == 'random'
+    if empty_original:
+        # A synthetic sequence does not need old sleep. Use a real, unambiguous
+        # device source from this day's backup; never invent a device identifier.
+        sources = {str(r.get('deviceCode', '')) for domain in ['sport', 'intensity', 'active']
+                   for r in rows(snapshot[domain])} - {'', '0', 'None'}
+        check(len(sources) == 1, 'No unique sleep source in execution backup')
+        begin = frozen['target_start']
+        original = [{'type': 9, 'deviceCode': sources.pop(), 'startTime': str(begin),
+                     'endTime': str(begin + 60000), 'timeZone': config['timezone'].replace(':', ''),
+                     'mergedFlag': 0, 'samplePoints': [{'key': SHALLOW, 'value': '',
+                     'startTime': str(begin), 'endTime': str(begin + 60000)}]}]
+    else:
+        original = validate(source_rows, continuous=True, allow_wake=natural and mode == 'random')
+        check(int(original[-1]['endTime']) - int(original[0]['startTime']) <= 86400000, 'Multiple nights are not supported')
     if mode == 'shift':
-        advance = choose(request.get('advance_minutes', 120), rng, -720, 720)
+        advance = frozen['advance_minutes'] if frozen else choose(request.get('advance_minutes', 120), rng, -720, 720)
         check(advance is not None, 'Shift missing')
         start = int(original[0]['startTime']) - advance * 60000
         sequence = [r['samplePoints'][0]['key'] for r in original]
+    elif frozen:
+        start = frozen['target_start']
+        sequence = list(frozen['sequence'])
     else:
         check(mode == 'random', 'Unknown sleep mode')
         sleep_lo, sleep_hi = map(clock, request['bedtime_range'])
@@ -164,28 +183,42 @@ def sleep_target(snapshot, config, request, rng, sampled_times=None):
         target.append(record)
     validate(target, start, end)
     totals = snapshot['sleep_stats'].get('professionalSleepTotal') or []
-    check(len(totals) == 1 and int(totals[0]['recordDay']) == int(config['date'].replace('-', '')), 'Unique sleep summary required')
-    summary = copy.deepcopy(totals[0])
+    if empty_original and not totals:
+        check(not request.get('restore_original_score'), 'Original score missing; backup before phone deletion')
+        summary = {'recordDay': int(config['date'].replace('-', '')), 'timeZone': config['timezone'].replace(':', ''),
+                   'professionalSleep': {'sleepScore': 0}}
+    else:
+        check(len(totals) == 1 and int(totals[0]['recordDay']) == int(config['date'].replace('-', '')), 'Unique sleep summary required')
+        summary = copy.deepcopy(totals[0])
     summary.update(dataSource=2, deviceCode='0')
     s = summary['professionalSleep']
     s.update(allSleepTime=len(target), daySleepTime=0, awakeTime=0,
              lightSleepTime=sequence.count(SHALLOW), deepSleepTime=sequence.count(DEEP), dreamTime=sequence.count(REM),
              fallAsleepTime=str(start), goBedTime=str(start), wakeupTime=str(end), risingTime=str(end), wakeupCnt=0)
     s['deepSleepPart'] = sum(stage == DEEP and (i == 0 or sequence[i - 1] != DEEP) for i, stage in enumerate(sequence))
-    if not request.get('restore_original_score', False):
+    from .sleep_scoring import score_mode, apply_score
+    if score_mode(request) != 'original':
         s['sleepScore'] = 0
     local = snapshot.get('local_sleep', {}).get('intervals', [])
-    check(all(int(r['start']) >= int(original[0]['startTime']) - 7200000 and
-              int(r['end']) <= int(original[-1]['endTime']) + 7200000 for r in local),
+    left = base - 43200000 if empty_original else int(original[0]['startTime']) - 7200000
+    right = base + 43200000 if empty_original else int(original[-1]['endTime']) + 7200000
+    check(all(left <= int(r['start']) < int(r['end']) <= right for r in local),
           'Local sleep includes another session; inspect selected-night deletion scope')
-    return {'mode': mode, 'target': target, 'summary': summary, 'target_start': start, 'target_end': end,
-            'delete_start': int(original[0]['startTime']), 'delete_end': int(original[-1]['endTime']),
-            'local_delete_start': min([int(original[0]['startTime'])] + [int(r['start']) for r in local]),
-            'local_delete_end': max([int(original[-1]['endTime'])] + [int(r['end']) for r in local]),
+    if empty_original:
+        check(left <= start < end <= right, 'Synthetic sleep outside selected-night cleanup window')
+    delete_start = left if empty_original else int(original[0]['startTime'])
+    delete_end = right if empty_original else int(original[-1]['endTime'])
+    result = {'mode': mode, 'target': target, 'summary': summary, 'target_start': start, 'target_end': end,
+            'delete_start': delete_start, 'delete_end': delete_end,
+            'local_delete_start': min([delete_start] + [int(r['start']) for r in local]),
+            'local_delete_end': max([delete_end] + [int(r['end']) for r in local]),
             'synthetic_not_measured': mode == 'random', 'original_score_not_recalculated': bool(request.get('restore_original_score'))}
+    if 'score_mode' in request:
+        apply_score(result, request)
+    return result
 
 
-def build_plan(snapshot, config, request, seed):
+def build_plan(snapshot, config, request, seed, frozen=None):
     for response in snapshot.values():
         check(isinstance(response, dict) and response.get('resultCode') == 0, 'Incomplete cloud backup; no write')
     rng = random.Random(seed)
@@ -197,10 +230,14 @@ def build_plan(snapshot, config, request, seed):
         check(request.get('increase_only') is True and request.get('exclude_sleep') is True and
               request.get('sleep', {}).get('stage_model') in ['natural_v1', 'natural_v2'] and not request.get('steps'),
               'Preset requires increase-only rings, sleep exclusion and unchanged steps')
-        targets, bed, wake = sample_preset(preset, rng)
-        early_sleep = sleep_target(snapshot, config, request['sleep'], rng, (bed, wake))
+        if frozen:
+            targets = copy.deepcopy(frozen['targets'])
+            early_sleep = sleep_target(snapshot, config, request['sleep'], rng, frozen=frozen['sleep'])
+        else:
+            targets, bed, wake = sample_preset(preset, rng)
+            early_sleep = sleep_target(snapshot, config, request['sleep'], rng, (bed, wake))
     elif request.get('exclude_sleep') and request.get('sleep'):
-        early_sleep = sleep_target(snapshot, config, request['sleep'], rng)
+        early_sleep = sleep_target(snapshot, config, request['sleep'], rng, frozen=frozen['sleep'] if frozen else None)
     if request.get('exclude_sleep'):
         exclusions = [(int(r['startTime']), int(r['endTime'])) for r in rows(snapshot['sleep'])]
         if early_sleep:
@@ -218,7 +255,9 @@ def build_plan(snapshot, config, request, seed):
     check(len(stats) == 1 and stats[0].get('sportType') == 0, 'Unique day sport total required')
     stat = copy.deepcopy(stats[0])
     check(int(stat['recordDay']) == int(config['date'].replace('-', '')), 'Sport day differs')
-    if not preset:
+    if frozen and not preset:
+        targets = copy.deepcopy(frozen['targets'])
+    elif not preset:
         targets = {name: choose(request.get(name), rng, low, high) for name, low, high in
                    [('calorie', 0, 10000), ('exercise', 0, 1440), ('steps', 0, 200000), ('active', 0, 24)]}
     sampled_targets = copy.deepcopy(targets)
@@ -324,7 +363,8 @@ def build_plan(snapshot, config, request, seed):
             notices.append('active: existing active hours are retained; lower total may be ignored')
         stat['activeHourBasic']['countActiveHour'] = targets['active']
     stat.update(dataSource=2, deviceCode='0')
-    sleep = early_sleep or (sleep_target(snapshot, config, request['sleep'], rng) if request.get('sleep') else None)
+    sleep = early_sleep or (sleep_target(snapshot, config, request['sleep'], rng,
+                          frozen=frozen['sleep'] if frozen else None) if request.get('sleep') else None)
     plan = {'format_version': 2, 'config': copy.deepcopy(config), 'request': copy.deepcopy(request), 'seed': seed,
             'baseline': copy.deepcopy(snapshot), 'baseline_fingerprint': fingerprint(snapshot), 'targets': targets,
             'sport': sport_changes, 'intensity': intensity, 'active': active, 'sport_summary': stat,
@@ -338,6 +378,22 @@ def build_plan(snapshot, config, request, seed):
 
 
 def validate_automation_plan(plan):
+    if plan.get('format_version') in [5, 6]:
+        from .generation import validate_generation
+        from .standalone import build
+        validate_generation(plan['generation'])
+        check(plan['generation']['request'].get('planning_mode') == 'standalone', 'Unsupported automation plan')
+        expected = build(plan['generation'], plan.get('baseline'), bound=plan['format_version'] == 6)
+        check(canonical(expected) == canonical(plan), 'Plan differs from deterministic backup/request/seed')
+        return plan
+    if plan.get('format_version') == 3:
+        from .generation import validate_generation
+        return validate_generation(plan)
+    if plan.get('format_version') == 4:
+        from .generation import bind_plan
+        expected = bind_plan(plan['generation'], plan['baseline'])
+        check(canonical(expected) == canonical(plan), 'Plan differs from deterministic backup/request/seed')
+        return plan
     check(plan.get('format_version') == 2, 'Unsupported automation plan')
     expected = build_plan(plan['baseline'], plan['config'], plan['request'], plan['seed'])
     check(canonical(expected) == canonical(plan), 'Plan differs from deterministic backup/request/seed')
@@ -345,13 +401,19 @@ def validate_automation_plan(plan):
 
 
 def describe(plan):
+    if plan.get('format_version') == 3:
+        from .generation import describe_generation
+        return describe_generation(plan)
     validate_automation_plan(plan)
     result = {'date': plan['config']['date'], 'targets': plan['targets'],
               'sport_minutes_changed': len(plan['sport']), 'exercise_minutes_added': len(plan['intensity']),
               'active_hours_added': len(plan['active']), 'notices': plan['notices']}
     if 'sampled_targets' in plan:
         result.update(sampled_targets=plan['sampled_targets'], skipped=plan['skipped'],
-                      awake_activity_windows=plan['awake_activity_windows'])
+                      awake_activity_windows=plan.get('awake_activity_windows', []))
+    if plan.get('standalone_generated'):
+        result.update(standalone_generated=True, execution_backup_required=False,
+                      comparisons=plan['comparisons'], original_data_required=False)
     if plan['sleep']:
         s = plan['sleep']
         tz = timezone_value(plan['config']['timezone'])
@@ -362,4 +424,8 @@ def describe(plan):
                            'delete_and_rebuild': True, 'phone_local_deletion_not_guaranteed': True}
         result['sleep']['local_delete_start'] = datetime.fromtimestamp(s['local_delete_start'] / 1000, tz).isoformat()
         result['sleep']['local_delete_end'] = datetime.fromtimestamp(s['local_delete_end'] / 1000, tz).isoformat()
+        result['sleep']['score'] = s['summary']['professionalSleep'].get('sleepScore', 0)
+        result['sleep']['score_mode'] = (s.get('score_provenance') or {}).get('mode',
+            'original' if s.get('original_score_not_recalculated') else 'none')
+        result['sleep']['score_provenance'] = s.get('score_provenance')
     return result

@@ -8,12 +8,12 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from .automation import execute, load, prepare, private
+from .automation import bind, execute, load, prepare, private
 from .automation_model import describe
 from .errors import user_message
 from .audit import source_fingerprints
 from .presets import preset_request
-from .batch import prepare_batch, describe_batch, execute_batch, selected_dates
+from .batch import bind_batch, prepare_batch, describe_batch, execute_batch, selected_dates
 from .input_validation import (InputValidationError, TARGETS, number, hours, time_range,
                                activity_windows, date_input, validate_config, validate_request)
 from .diagnostics import record_incident
@@ -25,6 +25,8 @@ def review_saved(path):
 
 
 LOADED_SOURCE_HASHES = source_fingerprints()
+SCORE_OPTIONS = {'不提交评分（手机显示 --）': 'none', '恢复备份原评分（不重算）': 'original',
+                 '按新分段估算（非华为官方评分）': 'estimate'}
 
 
 def source_is_current():
@@ -86,7 +88,7 @@ class Panel:
         outer = ttk.Frame(root, padding=20)
         outer.pack(fill='both', expand=True)
         ttk.Label(outer, text='运动健康数据调整', font=('Microsoft YaHei UI', 20, 'bold')).pack(anchor='w')
-        ttk.Label(outer, text='选择日期与目标 → 生成并查看计划 → 执行 → 手机同步验收').pack(anchor='w', pady=(4, 14))
+        ttk.Label(outer, text='生成与预览 → 执行 → 手机同步验收；依赖原数据的设置先读取原数据').pack(anchor='w', pady=(4, 14))
         setup = ttk.Frame(outer)
         setup.pack(fill='x')
         ttk.Label(setup, text='私有配置').grid(row=0, column=0, sticky='w')
@@ -103,7 +105,7 @@ class Panel:
         self.scheme_box = ttk.Combobox(setup, textvariable=self.scheme, values=['自定义', '默认方案'], state='readonly', width=16)
         self.scheme_box.grid(row=2, column=1, sticky='w', padx=10)
         self.scheme_box.bind('<<ComboboxSelected>>', self.scheme_changed)
-        ttk.Label(setup, text='默认：三环只增、睡眠随机、步数不改；截止留空为单日', foreground='#264e81').grid(row=3, column=0, columnspan=4, sticky='w', pady=(6, 0))
+        ttk.Label(setup, text='默认：有原值才比较三环；无原步数则生成配套步数，睡眠随机；截止留空为单日', foreground='#264e81').grid(row=3, column=0, columnspan=4, sticky='w', pady=(6, 0))
         setup.columnconfigure(1, weight=1)
         tabs = ttk.Notebook(outer)
         self.tabs = tabs
@@ -116,14 +118,14 @@ class Panel:
         ttk.Label(sport, text='留空表示不改；填写单值，或用“最小值-最大值”随机选择。').grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 10))
         for row, (name, label) in enumerate([('calorie', '活动热量 kcal'), ('exercise', '锻炼分钟'), ('steps', '每日步数'), ('active', '活动小时 0–24')], 1):
             self.entry(sport, row, name, label, '')
-        self.entry(sport, 5, 'activity_windows', '允许分配的时段', '12:00-14:30,18:00-24:00', width=42)
+        self.entry(sport, 5, 'activity_windows', '允许分配的时段（留空不限）', '00:00-24:00', width=42)
         self.entry(sport, 6, 'active_hours', '优先新增活动小时', '', hint='逗号分隔，如 9,17；留空由计划选择')
         self.preserve = tk.BooleanVar(value=True)
-        ttk.Checkbutton(sport, text='步数与锻炼优先安排在已有活动小时', variable=self.preserve).grid(row=7, column=0, columnspan=3, sticky='w', pady=8)
+        ttk.Checkbutton(sport, text='步数与锻炼优先已有活动小时；无原数据则生成清醒活动小时', variable=self.preserve).grid(row=7, column=0, columnspan=3, sticky='w', pady=8)
         ttk.Label(sport, text='部分日总数只接受增加。执行结果会分别显示请求值与实际云端值。', foreground='#795322').grid(row=8, column=0, columnspan=3, sticky='w')
         self.sleep_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(sleep, text='调整所选日期的整晚睡眠', variable=self.sleep_enabled).grid(row=0, column=0, columnspan=3, sticky='w')
-        self.sleep_mode = tk.StringVar(value='shift')
+        self.sleep_mode = tk.StringVar(value='random')
         ttk.Radiobutton(sleep, text='整体提前，保持原阶段顺序', variable=self.sleep_mode, value='shift').grid(row=1, column=0, columnspan=3, sticky='w', pady=8)
         self.entry(sleep, 2, 'advance_minutes', '提前分钟 / 随机范围', '120')
         ttk.Radiobutton(sleep, text='随机选择入睡、醒来，并生成合成阶段', variable=self.sleep_mode, value='random').grid(row=3, column=0, columnspan=3, sticky='w', pady=8)
@@ -131,13 +133,17 @@ class Panel:
         self.entry(sleep, 5, 'wake_range', '醒来区间 HH:MM-HH:MM', '07:00-09:00')
         self.entry(sleep, 6, 'duration_range', '总睡眠分钟范围', '420-540')
         self.restore_score = tk.BooleanVar(value=False)
-        ttk.Checkbutton(sleep, text='保留备份中的原评分（不是重新计算）', variable=self.restore_score).grid(row=7, column=0, columnspan=3, sticky='w', pady=8)
-        ttk.Label(sleep, text='先生成并保存计划，再在手机原版仅删所选晚并同步；程序核验云端为空后重建。', foreground='#795322').grid(row=8, column=0, columnspan=3, sticky='w')
+        self.score_selection = tk.StringVar(value=next(iter(SCORE_OPTIONS)))
+        ttk.Label(sleep, text='睡眠评分').grid(row=7, column=0, sticky='w', pady=8)
+        ttk.Combobox(sleep, textvariable=self.score_selection, values=list(SCORE_OPTIONS),
+                     state='readonly', width=36).grid(row=7, column=1, columnspan=2, sticky='w', padx=12)
+        ttk.Label(sleep, text='空白日期直接新增。已有睡眠须先备份，再仅清理所选晚；整体提前／保留原评分需要原数据。', foreground='#795322').grid(row=8, column=0, columnspan=3, sticky='w')
+        ttk.Label(sleep, text='估算按时长、阶段比例及切换次数计算；手机只显示数字，估算标记及依据保存在计划中。', foreground='#795322').grid(row=9, column=0, columnspan=3, sticky='w')
         actions = ttk.Frame(outer)
         self.actions = actions
         actions.pack(fill='x', pady=8)
         self.buttons = []
-        for title, fn in [('生成计划', self.prepare), ('打开已保存计划', self.open_plan), ('打开备份目录', self.open_folder), ('执行当前计划', self.apply), ('展开/收起参数', self.toggle_parameters)]:
+        for title, fn in [('生成计划', self.prepare), ('读取原数据（按需）', self.backup_plan), ('打开已保存计划', self.open_plan), ('打开备份目录', self.open_folder), ('执行当前计划', self.apply), ('展开/收起参数', self.toggle_parameters)]:
             button = ttk.Button(actions, text=title, command=fn)
             button.pack(side='left', padx=(0, 8))
             self.buttons.append(button)
@@ -155,7 +161,7 @@ class Panel:
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.poll)
         for variable in [self.config_path, self.date, self.end_date, self.scheme, self.preserve,
-                         self.sleep_enabled, self.sleep_mode, self.restore_score, *self.vars.values()]:
+                         self.sleep_enabled, self.sleep_mode, self.restore_score, self.score_selection, *self.vars.values()]:
             variable.trace_add('write', self.form_changed)
         if initial_error:
             root.after(0, lambda error=initial_error: self.display_error(self.incident(error, '加载配置')))
@@ -187,7 +193,13 @@ class Panel:
         return {'config_path': self.config_path.get(), 'date': self.date.get(), 'end_date': self.end_date.get(),
                 'scheme': self.scheme.get(), 'fields': {key: var.get() for key, var in self.vars.items()},
                 'preserve_active_hours': self.preserve.get(), 'sleep_enabled': self.sleep_enabled.get(),
-                'sleep_mode': self.sleep_mode.get(), 'restore_score': self.restore_score.get()}
+                'sleep_mode': self.sleep_mode.get(), 'restore_score': self.restore_score.get(),
+                'score_mode': self.selected_score_mode()}
+
+    def selected_score_mode(self):
+        if hasattr(self, 'score_selection'):
+            return SCORE_OPTIONS[self.score_selection.get()]
+        return 'original' if self.restore_score.get() else 'none'
 
     def form_changed(self, *args):
         if self.plan_path:
@@ -249,7 +261,9 @@ class Panel:
             self.preserve.set(True)
             self.sleep_enabled.set(True)
             self.sleep_mode.set('random')
-            self.restore_score.set(spec.get('restore_original_score', False))
+            self.restore_score.set(False)
+            if hasattr(self, 'score_selection'):
+                self.score_selection.set(next(iter(SCORE_OPTIONS)))
             for key in ['bedtime_range', 'wake_range', 'duration_range']:
                 self.vars[key].set('-'.join(map(str, request['sleep'][key])))
             self.status.set('默认方案按私有预设加权抽样；输入框显示范围。要编辑范围请切到自定义。')
@@ -263,13 +277,19 @@ class Panel:
         if self.scheme.get() == '默认方案':
             spec = read_config(self.config_path.get()).get('default_preset')
             preset_request(spec)
-            spec['restore_original_score'] = self.restore_score.get()
-            return preset_request(spec)
+            result = preset_request(spec, restore_original_score=self.selected_score_mode() == 'original')
+            result['sleep']['score_mode'] = self.selected_score_mode()
+            if self.selected_score_mode() == 'estimate':
+                result['sleep']['score_model'] = 'stage_estimate_v2'
+            return result
         data = {name: number(self.vars[name].get().strip(), *TARGETS[name]) for name in TARGETS}
         data.update(activity_windows=activity_windows(self.vars['activity_windows'].get()), preserve_active_hours=self.preserve.get(),
                     active_hours=hours(self.vars['active_hours'].get()))
         if self.sleep_enabled.get():
-            s = {'mode': self.sleep_mode.get(), 'restore_original_score': self.restore_score.get()}
+            s = {'mode': self.sleep_mode.get(), 'restore_original_score': self.selected_score_mode() == 'original',
+                 'score_mode': self.selected_score_mode()}
+            if self.selected_score_mode() == 'estimate':
+                s['score_model'] = 'stage_estimate_v2'
             if s['mode'] == 'shift':
                 s['advance_minutes'] = number(self.vars['advance_minutes'].get().strip(), '提前分钟', -720, 720, True)
             else:
@@ -306,7 +326,7 @@ class Panel:
             config = read_config(self.config_path.get())
             config['date'] = self.date.get().strip()
             date_input(config['date'])
-            validate_config(config)
+            # Offline generation needs date/timezone/preset, not ADB or app readiness.
             # Recompute overnight window when the panel date changes.
             config.pop('sleep_query_start_ms', None)
             config.pop('sleep_query_end_ms', None)
@@ -367,6 +387,10 @@ class Panel:
         self.sleep_enabled.set(bool(sleep))
         self.sleep_mode.set(sleep.get('mode', 'shift'))
         self.restore_score.set(sleep.get('restore_original_score', False))
+        if hasattr(self, 'score_selection'):
+            from .sleep_scoring import score_mode
+            mode = score_mode(sleep)
+            self.score_selection.set(next(label for label, key in SCORE_OPTIONS.items() if key == mode))
         for key, default in [('advance_minutes', 120), ('bedtime_range', ['23:00', '01:00']),
                              ('wake_range', ['07:00', '09:00']), ('duration_range', [420, 540])]:
             self.vars[key].set(formatted(sleep.get(key, default)))
@@ -393,7 +417,13 @@ class Panel:
             self.display_error(self.incident(error, '执行前计划检查', self.plan_path.parent))
             return
         batch = bool(plan.get('batch_format_version'))
-        if (batch or plan['sleep']) and not self.delete_confirm.get():
+        if (review_saved(self.plan_path).get('execution_backup_required')):
+            # First click only reads a backup and displays the bound plan. Writing
+            # requires a separate click after the user can review actual changes.
+            self.backup_plan()
+            return
+        standalone = review_saved(self.plan_path).get('standalone_generated')
+        if (batch or plan['sleep']) and not standalone and not self.delete_confirm.get():
             messagebox.showinfo('需要手机先清理旧睡眠', '先保存并核对计划，在手机原版“睡眠→所有数据”仅删除计划所选各晚，完成正常同步后勾选。程序还会验证云端分段及汇总为空；不会自动删除其他日期。')
             return
         plan_path = self.plan_path
@@ -402,13 +432,47 @@ class Panel:
         self.task(lambda: ('result', execute_batch(plan_path, confirmed, log, phone_deleted=confirmed) if batch else
                           execute(plan_path, allow_sleep_delete=confirmed, log=log, phone_deleted=confirmed)), '执行计划', plan_path.parent)
 
+    def backup_plan(self):
+        if self.busy:
+            return
+        if not self.plan_path:
+            messagebox.showinfo('尚无计划', '先离线生成或打开计划。')
+            return
+        if self.plan_inputs is None or self.form_values() != self.plan_inputs:
+            messagebox.showinfo('输入已变化', '请重新生成，或打开保存计划恢复输入后再核验。', parent=self.root)
+            return
+        try:
+            review = review_saved(self.plan_path)
+            current = load(self.plan_path)
+            can_bind = current.get('format_version') in [3, 5] or bool(current.get('batch_format_version') and
+                        all(load(self.plan_path.parent / d['path'])['format_version'] in [3, 5] for d in current['days']))
+            if not can_bind:
+                self.show_review(review)
+                self.status.set('当前已有完整备份方案；执行时仍会核验最新基线。')
+                return
+            plan = load(self.plan_path)
+            if plan.get('batch_format_version'):
+                first = load(self.plan_path.parent / plan['days'][0]['path'])
+                validate_config(first['config'])
+            else:
+                validate_config(plan['config'])
+            path = self.plan_path
+            self.pending_inputs = self.form_values()
+            self.delete_confirm.set(False)
+            log = lambda s: self.events.put(('log', s))
+            self.task(lambda: ('plan', bind_batch(path, log) if plan.get('batch_format_version') else bind(path, log)),
+                      '执行前备份／核验', path.parent)
+        except Exception as error:
+            self.display_error(self.incident(error, '执行前备份／核验', self.plan_path.parent))
+
     def show_review(self, value):
         if hasattr(self, 'tabs') and self.parameters_visible:
             self.toggle_parameters()
         self.output.delete('1.0', 'end')
         if value.get('batch'):
             self.output.insert('end', '批量日期：' + value['start'] + ' 至 ' + value['end'] + '（含首尾）\n')
-            self.output.insert('end', '执行前核验全部日期；按日执行，失败停止后续日期。确认框适用于下方全部睡眠日期。\n\n')
+            self.output.insert('end', ('所选设置需要原数据，请先读取原数据；随机结果保持不变。' if value.get('execution_backup_required') else
+                                    '执行前核验全部日期；按日执行，失败停止后续日期。确认框适用于下方全部睡眠日期。') + '\n\n')
             for day in value['days']:
                 self.output.insert('end', '\n'.join(self.review_lines(day)) + '\n\n')
             return
@@ -419,6 +483,10 @@ class Panel:
         target_text = '，'.join(names[k] + ' ' + str(v) for k, v in value['targets'].items() if v is not None)
         lines = ['计划日期：' + value['date'], '运动目标：' + (target_text or '不改'),
                  '运动分钟修改：' + str(value['sport_minutes_changed']) + '；新增锻炼分钟：' + str(value['exercise_minutes_added']) + '；新增活动小时：' + str(value['active_hours_added'])]
+        if value.get('offline_generated'):
+            lines[2] = '当前为离线计划，具体运动修改明细和清理范围将在执行前备份／核验后显示。'
+        if value.get('standalone_generated'):
+            lines.append('可直接执行：原值缺失则跳过比较。已有睡眠需按需读取备份并清理所选晚，空白日期直接新增。')
         if 'sampled_targets' in value:
             lines.append('独立抽样：' + '，'.join(names[k] + ' ' + str(v) for k, v in value['sampled_targets'].items() if v is not None))
             reasons = {'not_above_original': '不高于原值，保持原值', 'insufficient_awake_hours': '可新增清醒小时不足，保持原值'}
@@ -426,10 +494,23 @@ class Panel:
                 lines.append(names[k] + '：抽样 ' + str(detail['sampled']) + '，原值 ' + str(detail['original']) + '，' + reasons[detail['reason']])
         if 'sleep' in value:
             s = value['sleep']
+            if s.get('original_required'):
+                lines += ['睡眠整体提前：' + str(s['advance_minutes']) + ' 分钟（已固定）',
+                          '起止和原阶段：执行前读取原晚备份后显示。']
+                lines += value['notices']
+                return lines
             lines += ['睡眠：' + s['start'] + ' → ' + s['end'] + '，共 ' + str(s['minutes']) + ' 分钟',
                       '阶段分钟：' + json.dumps(s['stages'], ensure_ascii=False), '合成阶段：' + ('是' if s['synthetic_not_measured'] else '否，沿用原阶段顺序'),
                       '电脑旧睡眠清理范围：' + s['local_delete_start'] + ' → ' + s['local_delete_end'],
-                      '执行条件：保存计划后，先在手机原版删除此晚并正常同步；云端分段及汇总为空才重建。']
+                      ('执行条件：空白日期直接新增；已有睡眠先读取备份，仅删所选晚并同步，云空才上传。'
+                       if value.get('standalone_generated') else
+                       '执行条件：先读取原数据并审阅完整方案，再在手机删除所选晚并同步；云空才重建。')]
+            if 'score' in s:
+                modes = {'none': '不提交评分（手机显示 --）', 'original': '备份原评分，未重新计算',
+                         'estimate': '脚本估算，非华为官方评分'}
+                lines.append('睡眠评分：' + str(s['score']) + '；' + modes[s['score_mode']])
+                if (s.get('score_provenance') or {}).get('components'):
+                    lines.append('估算各项贡献：' + json.dumps(s['score_provenance']['components'], ensure_ascii=False))
         lines += [n for n in value['notices'] if ': skipped (' not in n]
         return lines
 
@@ -464,7 +545,10 @@ class Panel:
                     self.plan_path = value[1]
                     self.plan_inputs = self.pending_inputs
                     self.show_review(review_saved(self.plan_path))
-                    self.status.set('计划已生成并固定随机值，核对后可执行。' if self.form_values() == self.plan_inputs else '生成期间输入发生变化，请重新生成或打开保存计划后执行。')
+                    offline = review_saved(self.plan_path).get('execution_backup_required')
+                    self.status.set(('设置依赖原数据，请先点击读取原数据（按需）。' if offline else
+                                     '计划已保存，可执行；空白日期无需清理，无原值时跳过比较。') if self.form_values() == self.plan_inputs else
+                                    '生成期间输入发生变化，请重新生成或打开保存计划后执行。')
                 else:
                     result = value[1]
                     if result.get('batch'):
@@ -479,6 +563,13 @@ class Panel:
                     if 'sleep_cloud_segments_match' in result:
                         lines.append('睡眠分段云核验：' + ('通过' if result['sleep_cloud_segments_match'] else '未通过'))
                         lines.append('睡眠汇总云核验：' + ('通过' if result['sleep_cloud_summary_match'] else '未通过'))
+                        if 'sleep_registered_source_match' in result:
+                            lines.append('睡眠穿戴设备来源核验：' + ('通过' if result['sleep_registered_source_match'] and result.get('sleep_device_category_match') else '未通过'))
+                        if 'sleep_score' in result:
+                            score = result['sleep_score']
+                            names_score = {'none': '未提交评分', 'original': '备份原评分（未重算）',
+                                           'estimate': '脚本估算，非华为官方评分'}
+                            lines.append('睡眠评分：' + str(score['score']) + '；' + names_score[score['mode']])
                     lines.append('手机显示待正常同步验收。完整记录保存在备份目录。')
                     self.output.insert('end', '\n'.join(lines) + '\n')
                     self.status.set('执行结束。云端值见下方；手机显示请正常同步核验。')

@@ -1,17 +1,13 @@
 # 项目开发与交接
 
-中文沟通。开始先读README.md、docs/DEVELOPMENT_HANDOFF.md、docs/AUTOMATION.md及docs/PRIVACY.md；诊断看docs/TROUBLESHOOTING.md。docs/AI_HANDOFF.md同时保留旧手机手动删除流程，不把旧CLI与面板自动流程混用。
+中文沟通。新使用者读 README、docs/SETUP.md、docs/REPRODUCE.md；开发读 docs/DEVELOPMENT_HANDOFF.md、docs/AUTOMATION.md、docs/PRIVACY.md，诊断读 docs/TROUBLESHOOTING.md。
 
-目标是维护可直接运行的单日数据调整面板／CLI，在手机现有原版运动健康采用用户授权的三环、步数与睡眠调整，保持手机系统时间正常。下一阶段是优化脚本及增加用户提出的功能，维护计划可预览、操作可追溯、失败不盲目重复的行为。
+使用当前面板、automation 和 sleep_repair；历史顶层CLI没有完整受管理启动／双进程保护，不作为新写入入口。默认离线生成，全空日期不要求健康模板；整体提前、原评分和已有睡眠替换按需备份。手机原版单晚删除同步、云分段/汇总双空、电脑旧源/队列/字典清空后重建，不运行旧自动删云马上重建。
 
-所有真实配置、健康记录、运行计划、日志和截图放仓库外；不得提交个人目标、实际日期／时间／分数、设备或云ID、私人路径、凭据、厂商反编译源码。公开测试只用人工fixture；发布显式列文件白名单，项目署名及noreply邮箱，检查工作树和提交历史。
+保留固定方案、基线、哈希、范围、来源/类别/汇总写前检查、每批实际读回、全部 started/失败记录、会话锁、主进程/后台 guard 和新PID门控、退出UID双协议隔离及应用停用。只读就绪有限重试，健康写不自动重试。带 started 不重跑；新的固定恢复复制正确快照，不重新随机生成、不修改运动。
 
-默认开发验证是人工测试和只读诊断，不为了复现成功重跑真实删除／上传。实际操作依据用户当前明确范围和已有授权；不扩为批量历史处理、手机Root、配对变更或清应用数据。保留全部started及失败证据，不删标记绕过防重复。
+睡眠来源必须当前账号登记穿戴设备，类别来自原版字典；查询source1不是汇总请求source2。评分none/original/estimate，V2估算上限95，非华为官方和非医学评分；旧计划/模型兼容不改。手机显示、云、延迟及开表长期验收分别记录。关表短期通过不代表永久解决；详情记录时间云指定仍无已验证方法。
 
-保持prepare/review/apply边界、固定随机种子、严格基线核验、单日范围、会话锁、后台写入guard与退出清理。只读就绪探测可有限重试，健康写入不自动重试。内部接口版本改变需重新定位验证。
+真实配置/健康数据/计划/截图/日志/账号/设备或云ID/凭据/机器路径/厂商源码不入公开目录；仅原创代码、泛化文档、合成模板和人工测试。发布显式白名单、审查工作树/index/完整历史，项目署名和contributors@users.noreply.github.com。用户当前明确授权优先；不扩大真实操作到其他日期、Root手机、换包、配对或批量。
 
-每次变更记录问题、修改、测试和限制。运行证据用events_private.jsonl、runtime源码哈希、每批响应／读回及result／failure。云采用、用户可用反馈、手机显示和长期稳定性分别记录，不夸大结果。
-
-验证：python -m unittest discover -s tests -v；变更JS时用node --check对应文件；限定清理事务另用node tests/native_sleep_cleanup.js人工SQLite验证。当前最近完整测试89项通过。仅文档变更校验链接／内容／隐私即可，不执行真实健康写入。
-
-睡眠执行以docs/SLEEP_RECURRENCE.md为准：保存完整计划后，用户在手机原版仅删所选晚并正常同步；验证云分段及汇总空、运动基线一致，清电脑旧源／已完成删除队列／旧时间字典，真实读回空后才重建。不再自动删云后立即重建。主进程与后台都guard，新增健康进程保持暂停；退出保留当前模拟器运行期间UID隔离，不将短期核验当长期稳定。诊断启动曾发生非预期后台删除，报告不能称该轮完全只读无副作用。全部旧started与失败任务保留，新恢复任务注明完整备份来源。
+验证：python -m unittest discover -s tests -v；修改JS运行node --check及tests/native_upload_source.js、tests/native_sleep_cleanup.js。新sleep_repair通用代码用人工测试，同一方法的私有单晚已手机验收，本轮发布不重新写真实健康。保留用户已有改动，结果说明修改、验证与实际限制。

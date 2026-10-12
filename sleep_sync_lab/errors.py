@@ -81,6 +81,20 @@ def user_message(error):
         return error.user_message
     # Match known authored validations only. Never echo arbitrary native exceptions.
     mappings = {
+        'Registered sleep device unavailable or ambiguous': '没有唯一可用的已登记穿戴设备睡眠来源，尚未写入。请核对设备登记；存在多个来源时在私有配置选择 sleep_upload_device_code。随机睡眠不需要历史记录模板。',
+        'Sleep registered source/category not adopted': '睡眠的穿戴设备来源或汇总设备类别未被采用，已停止。请查看私有读回记录，不要重复执行已有写入标记的计划。',
+        'Registered upload source unavailable': '未取得已登记的上传设备来源，尚未写入。请确认电脑原版已登录并完成设备登记；这与所选日是否有健康数据无关。',
+        'Existing sleep requires backup and phone selected-night deletion before upload': '所选晚已有睡眠或电脑旧源，尚未写入。点击“读取原数据（按需）”保存备份，再在手机仅删除所选晚并同步；空白日期不需要此步骤。',
+        'Original data required by selected options': '整体提前或保留原评分需要对应原数据，请先读取原数据；无原记录可改用随机睡眠并取消保留原评分。',
+        'Target exceeds awake minute capacity': '目标超过允许清醒时段可合理分配的容量。请扩大时段、增加活动小时或降低目标。',
+        'Step target exceeds awake minute capacity': '步数超过允许清醒时段可分配的容量。请扩大时段或降低步数。',
+        'Movement conflicts with zero active hours': '非零运动目标与零活动小时矛盾。请提高活动小时，或将该项留空让程序分配。',
+        'Movement conflicts with existing active hour capacity': '运动目标与原活动小时容量冲突。请设置可容纳运动的活动小时目标或调整时段。',
+        'Offline plan needs execution backup and review before apply': '当前是离线计划，请先点击执行前备份／核验，查看完整方案后再执行。命令行请先运行bind并使用返回的plan_path。',
+        'Only offline plans need execution backup': '当前已有可执行方案，请核对完整预览后继续；不要重复生成覆盖原备份。',
+        'No unique sleep source in execution backup': '已生成合成睡眠，但执行前备份没有唯一可用设备来源，尚未写入。请核对原版同步数据。',
+        'Original score missing; backup before phone deletion': '原评分备份缺失，尚未写入。保留评分必须在手机删除前备份；若只需合成睡眠，请取消保留评分并重新生成。',
+        'Synthetic sleep outside selected-night cleanup window': '新睡眠超出所选夜间清理窗口，已停止。请核对起床日和入睡／醒来区间。',
         'Cloud backup incomplete; no writes performed': '云端备份读取未完成，尚未写入。请确认电脑原版已登录并联网。',
         'PC CPU mismatch': '模拟器CPU类型与电脑实验配置不符，已停止。请检查是否连接到配置的电脑模拟器。',
         'PC profile mismatch': '模拟器型号或主板与已核实配置不符，已停止。请检查ADB目标和私有配置。',
@@ -90,7 +104,7 @@ def user_message(error):
         'Existing forward retained; choose a free port': '配置的本地Frida端口已有连接转发，已停止。请检查旧会话是否结束，不要直接删除运行中会话的连接。',
         'Real data must be outside the public repository': '配置、计划和备份目录必须放在公开仓库外。请重新选择本机私有文件或目录。',
         'Unsupported automation plan': '该文件不是当前面板支持的计划格式。请使用面板生成的plan或batch_plan文件。',
-        'No records': '所选睡眠查询范围没有可用原记录。请检查起床日期；当前流程需要原晚备份，不能从空记录重建。',
+        'No records': '所选范围没有供整体提前或旧计划使用的原睡眠。请检查起床日；无原记录可改用随机睡眠并取消保留原评分。',
         'Missing source': '睡眠原记录缺少有效来源标识，已停止。请核对原版数据和私有备份。',
         'Mixed type/source': '睡眠备份混合多个设备来源或数据类型，当前不能自动重建。请核对所选晚。',
         'Gap in target': '睡眠原记录含时间空档，当前要求连续记录，已停止生成。请核对所选晚及私有备份。',
@@ -123,4 +137,11 @@ def user_message(error):
         'Sleep changed or old tail returned during verification': '完整睡眠窗口核验发现变化或旧尾段，已停止。请保留当前记录，不要重新执行旧计划。',
         'A new app process was paused; session stopped before further requests': '电脑运动健康出现新的未保护进程，已暂停该进程并停止任务。请查看私有记录。',
     }
+    mappings.update({
+        'Sleep summary request scope invalid': '睡眠汇总的日期、请求来源或时区不正确，已在写入前停止。请重新生成并核对新计划。',
+        'Sleep target is not the registered wearable; create and review a new plan': '该睡眠计划使用了手机或不匹配的设备来源，已在任何健康写入前停止。请用新版重新生成并核对计划，保留旧证据。',
+        'Sleep summary wearable category missing or mismatched; create a new plan': '睡眠汇总缺少正确的穿戴设备类别，手机可能无法显示详情，已在写入前停止。请用新版生成新计划。',
+        'Sleep summary disagrees with minute timeline': '睡眠汇总起止或阶段时长与分段不一致，已在写入前停止。请检查私有计划。',
+        'Original score missing or invalid; backup a positive score before phone deletion': '备份没有有效的原评分（需1–100分）。请先保存删除前备份，或选择不提交评分／脚本估算。',
+    })
     return mappings.get(str(error), '操作停止。请查看私有任务目录中的失败记录；已有写入标记的计划不要重复执行。')

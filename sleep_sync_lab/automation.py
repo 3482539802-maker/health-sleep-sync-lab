@@ -12,6 +12,10 @@ from .model import bounds, check, content, digest, rows, timezone_value
 from .errors import user_message
 from .audit import event, failure_details, runtime_manifest
 from .input_validation import validate_request, date_input, InputValidationError
+from .generation import generate, bind_plan
+from .standalone import (bind_source, known_totals, local_has_sleep, resolve,
+                         sleep_empty, SOURCE)
+from .sleep_preflight import registered_sleep_source, validate_sleep_upload
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 
@@ -67,7 +71,9 @@ def snapshot_with_retry(client):
     # Read-only retry after initial app login/network readiness; no mutation retry.
     for attempt in range(3):
         value = client.snapshot()
-        if all(isinstance(v, dict) and v.get('resultCode') == 0 for v in value.values()):
+        required = ['sport', 'sport_stats', 'intensity', 'active', 'sleep', 'sleep_stats']
+        if isinstance(value, dict) and all(isinstance(value.get(k), dict) and value[k].get('resultCode') == 0
+                                           for k in required):
             return value
         if attempt < 2:
             time.sleep(1)
@@ -75,6 +81,91 @@ def snapshot_with_retry(client):
 
 
 def prepare(config, request, directory, log=lambda message: None):
+    request = copy.deepcopy(request)
+    if (request.get('sleep') or {}).get('score_mode') == 'estimate':
+        request['sleep'].setdefault('score_model', 'stage_estimate_v2')
+    request.setdefault('planning_mode', 'standalone')
+    directory = private(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    try:
+        save(directory / 'request_private.json', request)
+        validate_request(request)
+        config = settings(config)
+        save(directory / 'config_private.json', config)
+        save(directory / 'prepare_runtime_private.json', runtime_manifest())
+        event(directory, 'prepare_begin', offline=True)
+        log('正在离线生成固定目标和睡眠阶段，无需连接模拟器或读取原数据…')
+        plan = generate(config, request, secrets.randbits(64))
+        path = directory / 'plan_private.json'
+        save(path, plan)
+        save(directory / 'review_private.json', describe(plan))
+        event(directory, 'prepare_complete', offline=True, plan_sha256=digest(path))
+        log('计划已保存。' + ('所选设置依赖原数据，请先读取原数据。' if plan.get('execution_backup_required') else
+                            '可直接执行；原值不存在时跳过比较，空白日期可新增。'))
+        return path
+    except Exception as error:
+        save_failure(directory, 'prepare_failure_private.json', {'traceback': traceback.format_exc(),
+                     'message': user_message(error), 'diagnostics': failure_details(error)})
+        event(directory, 'prepare_failed', error_type=type(error).__name__)
+        raise
+
+
+def bind(plan_path, log=lambda message: None, output_directory=None):
+    """Read-only backup and reviewed executable plan; preserve the offline original."""
+    plan_path = private(plan_path)
+    original = validate_automation_plan(load(plan_path))
+    check(original['format_version'] in [3, 5], 'Only offline plans need execution backup')
+    generation = original['generation'] if original['format_version'] == 5 else original
+    check(not (plan_path.parent / 'generation_apply_started_private.json').exists() and
+          not (plan_path.parent / 'apply_started_private.json').exists(),
+          'An execution marker exists; do not repeat this plan')
+    plan_hash = digest(plan_path)
+    directory = private(output_directory) if output_directory is not None else plan_path.parent / ('execution_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+    lock = plan_path.parent.parent / '.health_panel.lock'
+    try:
+        with lock.open('x', encoding='utf-8') as handle:
+            handle.write(str(plan_path))
+    except FileExistsError:
+        raise ValueError('Another job or unfinished session lock exists; inspect before proceeding')
+    created = False
+    try:
+        directory.mkdir(parents=True, exist_ok=False)
+        created = True
+        config = generation['config']
+        save(directory / 'config_private.json', config)
+        save(directory / 'request_private.json', generation['request'])
+        save(directory / 'prepare_runtime_private.json', runtime_manifest())
+        event(directory, 'bind_begin', offline_plan_sha256=plan_hash)
+        log('正在连接模拟器，读取执行前备份并核验可修改范围…')
+        connection = AutomationClient(config)
+        connection.startup_log = log
+        with connection as client:
+            save(directory / 'prepare_session_guard_private.json', client.guard_state())
+            snapshot = snapshot_with_retry(client)
+            if generation['sleep']:
+                snapshot['local_sleep'] = client.local_sleep()
+        save(directory / 'backup_private.json', snapshot)
+        plan = bind_plan(generation, snapshot)
+        check(digest(plan_path) == plan_hash, 'Plan changed while checking backup')
+        path = directory / 'plan_private.json'
+        save(path, plan)
+        save(directory / 'review_private.json', describe(plan))
+        save(directory / 'generation_origin_private.json', {'path': str(plan_path), 'sha256': plan_hash})
+        event(directory, 'bind_complete', plan_sha256=digest(path))
+        log('原数据读取和完整方案已保存，未写健康数据。请核对明细；已有睡眠才需清理手机所选晚。')
+        return path
+    except Exception as error:
+        if created:
+            save_failure(directory, 'prepare_failure_private.json', {'traceback': traceback.format_exc(),
+                         'message': user_message(error), 'diagnostics': failure_details(error)})
+            event(directory, 'bind_failed', error_type=type(error).__name__)
+        raise
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def prepare_with_backup(config, request, directory, log=lambda message: None):
+    """Explicit legacy backup-based preparation; existing version-2 plans stay valid."""
     directory = private(directory)
     directory.mkdir(parents=True, exist_ok=False)
     try:
@@ -85,7 +176,9 @@ def prepare(config, request, directory, log=lambda message: None):
         log('输入检查通过，正在检查ADB并隔离启动电脑原版…')
         save_failure(directory, 'prepare_runtime_private.json', runtime_manifest())
         event(directory, 'prepare_begin')
-        with AutomationClient(config) as client:
+        connection = AutomationClient(config)
+        connection.startup_log = log
+        with connection as client:
             event(directory, 'session_ready', phase='prepare')
             save(directory / 'prepare_session_guard_private.json', client.guard_state())
             snapshot = snapshot_with_retry(client)
@@ -139,14 +232,53 @@ def check_baseline(actual, expected, plan, phone_deleted=False):
               'Phone night deletion and empty cloud segments/summary required before rebuild')
 
 
+def standalone_preflight(plan, current, allow_sleep_delete=False, phone_deleted=False):
+    """Missing originals are valid; conflicts and failed reads still stop before writes."""
+    if plan['format_version'] == 6:
+        check_baseline(current, plan['baseline'], plan, phone_deleted=bool(plan['sleep']))
+    if plan['sleep']:
+        check(sleep_empty(current), 'Existing sleep requires backup and phone selected-night deletion before upload')
+        local = current['local_sleep']
+        old = plan.get('baseline', {})
+        replace = bool(old and (not sleep_empty(old) or local_has_sleep(old.get('local_sleep', {}))))
+        if local_has_sleep(local) or replace:
+            check(plan['format_version'] == 6, 'Existing sleep requires backup and phone selected-night deletion before upload')
+            check(allow_sleep_delete is True and phone_deleted is True,
+                  'Phone night deletion and empty cloud segments/summary required before rebuild')
+    result = resolve(plan, current)
+    if result['sleep']:
+        s = result['sleep']
+        for key in ['intervals', 'pendingDeletes', 'dictionaryIntervals', 'pendingDictionaryDeletes']:
+            check(all(s['local_delete_start'] <= int(r['start']) < int(r['end']) <= s['local_delete_end']
+                      for r in current['local_sleep'].get(key, [])),
+                  'Local sleep includes another session; inspect selected-night deletion scope')
+    return result
+
+
 def execute(plan_path, allow_sleep_delete=False, log=lambda message: None, phone_deleted=False):
     plan_path = private(plan_path)
     directory = plan_path.parent
     plan = validate_automation_plan(load(plan_path))
+    check(plan['format_version'] != 3, 'Offline plan needs execution backup and review before apply')
     plan_hash = digest(plan_path)
+    origin = None
+    if plan['format_version'] in [4, 6]:
+        provenance = load(directory / 'generation_origin_private.json')
+        origin = private(provenance['path'])
+        original = load(origin)
+        original_generation = original.get('generation', original) if original.get('format_version') == 5 else original
+        check(digest(origin) == provenance['sha256'] and canonical(original_generation) == canonical(plan['generation']),
+              'Plan differs from deterministic backup/request/seed')
+        check(not (origin.parent / 'generation_apply_started_private.json').exists() and
+              not (origin.parent / 'apply_started_private.json').exists(),
+              'An execution marker exists; do not repeat this plan')
     check(not (directory / 'apply_started_private.json').exists(), 'An execution marker exists; do not repeat this plan')
-    check(not plan['sleep'] or allow_sleep_delete is True, 'Explicit selected-night deletion confirmation required')
-    check(not plan['sleep'] or phone_deleted is True,
+    if plan['format_version'] == 5:
+        check(not (directory / 'generation_apply_started_private.json').exists(),
+              'An execution marker exists; do not repeat this plan')
+    standalone = plan.get('standalone_generated') is True
+    check(standalone or not plan['sleep'] or allow_sleep_delete is True, 'Explicit selected-night deletion confirmation required')
+    check(standalone or not plan['sleep'] or phone_deleted is True,
           'Phone night deletion and empty cloud segments/summary required before rebuild')
     lock = directory.parent / '.health_panel.lock'
     try:
@@ -158,7 +290,9 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None, phone
     try:
         save_failure(directory, 'apply_runtime_private.json', runtime_manifest())
         event(directory, 'apply_begin', plan_sha256=plan_hash, sleep_delete_authorized=bool(allow_sleep_delete))
-        with AutomationClient(plan['config']) as client:
+        connection = AutomationClient(plan['config'])
+        connection.startup_log = log
+        with connection as client:
             event(directory, 'session_ready', phase='apply')
             # Preparation, old task evidence and each pre-write attempt are immutable.
             # Retrying a connection/baseline failure must not overwrite or collide.
@@ -166,10 +300,39 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None, phone
             current = snapshot_with_retry(client)
             if plan['sleep']:
                 current['local_sleep'] = client.local_sleep()
+                successful(current['local_sleep'])
             save_failure(directory, 'before_apply_private.json', current)
-            check_baseline(current, plan['baseline'], plan, phone_deleted=phone_deleted)
+            if standalone:
+                plan = standalone_preflight(plan, current, allow_sleep_delete, phone_deleted)
+                resolved_review = describe(plan)
+                source = registered_sleep_source(client, plan) if plan['sleep'] else client.upload_source()
+                plan = bind_source(plan, source)
+                save_failure(directory, 'upload_source_private.json', source)
+                save_failure(directory, 'resolved_plan_private.json', plan)
+                save_failure(directory, 'resolved_review_private.json', resolved_review)
+                log('执行核验完成：无原值的项目跳过比较，按目标生成明细。')
+            else:
+                check_baseline(current, plan['baseline'], plan, phone_deleted=phone_deleted)
+                if plan['sleep']:
+                    source = registered_sleep_source(client, plan)
+                    save_failure(directory, 'upload_source_private.json', source)
+            if plan['sleep']:
+                validate_sleep_upload(plan, source)
+                # Preserve immutable old plans; attach evidence to this execution only.
+                plan['sleep']['registered_source'] = copy.deepcopy(source['sleepSource'])
+                save_failure(directory, 'sleep_upload_preflight_private.json', {
+                    'request_scope_valid': True, 'registered_source_valid': True,
+                    'summary_matches_timeline': True, 'before_any_health_write': True})
             check(digest(plan_path) == plan_hash, 'Plan changed while checking backup')
             event(directory, 'baseline_verified', plan_sha256=plan_hash)
+            if origin is not None:
+                check(digest(origin) == provenance['sha256'], 'Plan changed while checking backup')
+                # Multiple read-only bindings must not become multiple executions
+                # of the same frozen generation. This marker survives rebinding.
+                save(origin.parent / 'generation_apply_started_private.json', {'plan_sha256': provenance['sha256'],
+                     'execution_plan_sha256': plan_hash, 'execution_path': str(plan_path)})
+            elif standalone and load(plan_path)['format_version'] == 5:
+                save(directory / 'generation_apply_started_private.json', {'plan_sha256': plan_hash})
             save(directory / 'apply_started_private.json', {'plan_sha256': plan_hash,
                  'sleep_delete_authorized': bool(allow_sleep_delete), 'phone_deleted_confirmed': bool(phone_deleted), 'local_time': datetime.now().astimezone().isoformat()})
             wrote = True
@@ -198,7 +361,8 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None, phone
                             actual = lookup.get(sport_key(item))
                             check(actual is not None, 'Uploaded sport minute missing')
                             for field in ['steps', 'calorie']:
-                                check(actual['sportBasicInfos'][0][field] == item['sportBasicInfos'][0][field], 'Sport minute not adopted')
+                                if field in item['sportBasicInfos'][0]:
+                                    check(actual['sportBasicInfos'][0].get(field) == item['sportBasicInfos'][0][field], 'Sport minute not adopted')
                     else:
                         domain_response = after['intensity' if domain == 'intensity' else 'active']
                         actual = {semantic_health(r) for r in rows(domain_response)}
@@ -247,7 +411,8 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None, phone
                       'Phone night deletion and empty cloud segments/summary required before rebuild')
                 event(directory, 'sleep_cloud_empty_verified')
                 client.configure(delete_scope=local_scope, sleep_cloud_empty_verified=True)
-                operation('sleep_retire_acknowledged_local_deletes', lambda: client.retire_acknowledged_sleep_deletes(local_scope['start'], local_scope['end']))
+                if not standalone or local_has_sleep(after_local):
+                    operation('sleep_retire_acknowledged_local_deletes', lambda: client.retire_acknowledged_sleep_deletes(local_scope['start'], local_scope['end']))
                 settled = client.local_sleep()
                 save(directory / 'sleep_local_settled_private.json', settled)
                 successful(settled)
@@ -284,24 +449,33 @@ def execute(plan_path, allow_sleep_delete=False, log=lambda message: None, phone
                           'Pending sleep deletions remain; rebuild refused')
             final = snapshot_with_retry(client)
             save(directory / 'final_private.json', final)
-            total = final['sport_stats']['sportStat'][0]
-            measured = {'calorie': total['sportBasicInfo']['calorie'] / 1000,
-                        'steps': total['sportBasicInfo']['steps'],
-                        'exercise': total['exerciseTimeBasic']['totalMidHighIntensity'],
-                        'active': total['activeHourBasic']['countActiveHour']}
+            measured = known_totals(final)
             result = {'writes_performed': True, 'targets': plan['targets'], 'cloud_totals': measured,
                       'target_adopted': {k: measured[k] == v for k, v in plan['targets'].items() if v is not None},
                       'phone_verification_pending': True, 'sleep_phone_local_deletion_not_guaranteed': bool(plan['sleep']),
                       'notices': plan['notices']}
+            if standalone:
+                result.update(comparisons=plan['comparisons'], skipped=plan['skipped'],
+                              sampled_targets=plan['sampled_targets'])
             if plan['sleep']:
                 final_sleep = client.health_read(9, plan['sleep']['target_start'], plan['sleep']['target_end'])
                 save(directory / 'sleep_final_scoped_private.json', final_sleep)
                 successful(final_sleep)
+                result['sleep_score'] = (plan['sleep'].get('score_provenance') or {
+                    'mode': 'original' if plan['sleep'].get('original_score_not_recalculated') else 'none',
+                    'score': plan['sleep']['summary']['professionalSleep'].get('sleepScore', 0),
+                    'vendor_recalculated': False})
                 result['sleep_cloud_segments_match'] = {semantic_health(r) for r in rows(final['sleep'])} == {semantic_health(r) for r in plan['sleep']['target']}
                 totals = final['sleep_stats'].get('professionalSleepTotal') or []
                 result['sleep_cloud_summary_match'] = len(totals) == 1 and all(
                     totals[0]['professionalSleep'].get(k) == plan['sleep']['summary']['professionalSleep'].get(k)
                     for k in ['allSleepTime', 'lightSleepTime', 'deepSleepTime', 'dreamTime', 'fallAsleepTime', 'wakeupTime', 'sleepScore'])
+                if plan['sleep'].get('registered_source'):
+                    result['sleep_registered_source_match'] = all(
+                        str(r['deviceCode']) == plan['sleep']['registered_source']['deviceCode'] for r in rows(final['sleep']))
+                    result['sleep_device_category_match'] = len(totals) == 1 and totals[0]['professionalSleep'].get('deviceCategory') == plan['sleep']['registered_source']['deviceCategory']
+                    check(result['sleep_registered_source_match'] and result['sleep_device_category_match'],
+                          'Sleep registered source/category not adopted')
                 check(result['sleep_cloud_segments_match'] and result['sleep_cloud_summary_match'],
                       'Sleep full window or summary changed; verification failed')
             save(directory / 'result_private.json', result)
@@ -325,6 +499,8 @@ def main():
     preview = sub.add_parser('prepare')
     for name in ['config', 'request', 'job']:
         preview.add_argument('--' + name, required=True)
+    binding = sub.add_parser('bind', help='Read-only execution backup; returns a new executable plan path')
+    binding.add_argument('--plan', required=True)
     apply = sub.add_parser('apply')
     apply.add_argument('--plan', required=True)
     apply.add_argument('--allow-sleep-delete', action='store_true')
@@ -336,6 +512,11 @@ def main():
         if args.action == 'prepare':
             path = prepare(load(private(args.config)), load(private(args.request)), args.job)
             result = describe(load(path))
+            result['plan_path'] = str(path)
+        elif args.action == 'bind':
+            path = bind(args.plan)
+            result = describe(load(path))
+            result['plan_path'] = str(path)
         elif args.action == 'review':
             result = describe(load(private(args.plan)))
         else:

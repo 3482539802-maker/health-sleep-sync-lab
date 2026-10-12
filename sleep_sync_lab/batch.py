@@ -1,17 +1,18 @@
 """Reviewed multi-day manifests, all-day preflight, durable progress, no write retries."""
 import copy
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import hashlib
 from pathlib import Path
 import secrets
 import traceback
-from .automation import (AutomationClient, check_baseline, execute, load, private, save,
-                         save_failure, settings, snapshot_with_retry)
+from .automation import (AutomationClient, bind, check_baseline, execute, load, private, save,
+                         save_failure, settings, snapshot_with_retry, standalone_preflight)
 from .automation_model import build_plan, describe, canonical, validate_automation_plan
 from .audit import event, failure_details, runtime_manifest
 from .errors import user_message
 from .model import check, digest
 from .input_validation import validate_request, date_input, InputValidationError
+from .generation import generate
 
 
 def selected_dates(start, end):
@@ -35,6 +36,10 @@ def derived_seed(seed, day, attempt=0):
 
 
 def prepare_batch(config, request, start, end, directory, log=lambda message: None):
+    request = copy.deepcopy(request)
+    if (request.get('sleep') or {}).get('score_mode') == 'estimate':
+        request['sleep'].setdefault('score_model', 'stage_estimate_v2')
+    request.setdefault('planning_mode', 'standalone')
     validate_request(request)
     dates = selected_dates(start, end)
     check(bool(request.get('preset')), 'Batch requires a configurable default preset')
@@ -48,20 +53,16 @@ def prepare_batch(config, request, start, end, directory, log=lambda message: No
     seen = set()
     try:
         for day in dates:
-            log('只读备份并生成 ' + day + ' 的独立计划…')
+            log('离线生成 ' + day + ' 的独立计划…')
             child = directory / 'days' / day
             child.mkdir(parents=True)
             cfg = day_config(config, day)
             save(child / 'config_private.json', cfg)
             save(child / 'request_private.json', request)
             save(child / 'prepare_runtime_private.json', runtime_manifest())
-            with AutomationClient(cfg) as client:
-                snapshot = snapshot_with_retry(client)
-                snapshot['local_sleep'] = client.local_sleep()
-            save(child / 'backup_private.json', snapshot)
             for attempt in range(100):
-                plan = build_plan(snapshot, cfg, request, derived_seed(manifest['seed'], day, attempt))
-                signature = canonical([plan['sampled_targets'], plan['sleep']['target_start'] % 86400000,
+                plan = generate(cfg, request, derived_seed(manifest['seed'], day, attempt))
+                signature = canonical([plan['targets'], plan['sleep']['target_start'] % 86400000,
                                        plan['sleep']['target_end'] - plan['sleep']['target_start']])
                 if signature not in seen:
                     break
@@ -77,7 +78,7 @@ def prepare_batch(config, request, start, end, directory, log=lambda message: No
         save(path, manifest)
         save(directory / 'review_private.json', describe_batch(path))
         event(directory, 'batch_prepare_complete', days=len(dates), manifest_sha256=digest(path))
-        log('所有日期计划已保存，尚未上传或删除健康数据。')
+        log('所有日期离线计划已保存，无需原数据；执行前请备份／核验。')
         return path
     except Exception as error:
         save_failure(directory, 'prepare_failure_private.json', {'message': user_message(error),
@@ -102,8 +103,11 @@ def validate_batch(path):
         plan = validate_automation_plan(load(child))
         check(plan['config']['date'] == entry['date'] and bool(plan['request'].get('preset')), 'Batch child date/preset differs')
         plans.append((child, plan))
-    scopes = sorted((p['sleep']['local_delete_start'], p['sleep']['local_delete_end']) for _, p in plans)
-    check(all(a[1] <= b[0] for a, b in zip(scopes, scopes[1:])), 'Batch sleep deletion scopes overlap')
+    offline = [p['format_version'] == 3 for _, p in plans]
+    check(all(offline) or not any(offline), 'Batch mixes offline and executable plans')
+    if not any(offline):
+        scopes = sorted((p['sleep']['local_delete_start'], p['sleep']['local_delete_end']) for _, p in plans)
+        check(all(a[1] <= b[0] for a, b in zip(scopes, scopes[1:])), 'Batch sleep deletion scopes overlap')
     return manifest, plans
 
 
@@ -111,18 +115,87 @@ def describe_batch(path):
     manifest, plans = validate_batch(path)
     return {'batch': True, 'start': manifest['start'], 'end': manifest['end'],
             'days': [describe(p) for _, p in plans], 'stop_on_first_failure': True,
-            'all_days_preflight_required': True, 'writes_performed': False}
+            'all_days_preflight_required': True, 'writes_performed': False,
+            'offline_generated': all(p['format_version'] == 3 for _, p in plans),
+            'execution_backup_required': any(p.get('execution_backup_required', False) for _, p in plans),
+            'standalone_generated': all(p.get('standalone_generated') for _, p in plans)}
+
+
+def bind_batch(path, log=lambda message: None):
+    path = private(path)
+    manifest, plans = validate_batch(path)
+    check(all(p['format_version'] in [3, 5] for _, p in plans), 'Only offline plans need execution backup')
+    check(not (path.parent / 'generation_batch_apply_started_private.json').exists() and
+          not (path.parent / 'batch_apply_started_private.json').exists(),
+          'An execution marker exists; do not repeat this plan')
+    original_hash = digest(path)
+    directory = path.parent / ('execution_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+    lock = path.parent.parent / '.health_panel.lock'
+    try:
+        with lock.open('x', encoding='utf-8') as handle:
+            handle.write(str(path))
+    except FileExistsError:
+        raise ValueError('Another job or unfinished session lock exists; inspect before proceeding')
+    try:
+        directory.mkdir()
+        save(directory / 'config_private.json', load(path.parent / 'config_private.json'))
+        save(directory / 'request_private.json', load(path.parent / 'request_private.json'))
+        save(directory / 'prepare_runtime_private.json', runtime_manifest())
+        event(directory, 'batch_bind_begin', offline_manifest_sha256=original_hash)
+        bound = copy.deepcopy(manifest)
+        bound['days'] = []
+        for child, plan in plans:
+            day = plan['config']['date']
+            log(day + '：读取执行前备份并核验…')
+            result = bind(child, log, directory / 'days' / day)
+            bound['days'].append({'date': day, 'path': result.relative_to(directory).as_posix(), 'sha256': digest(result)})
+        check(digest(path) == original_hash, 'Plan changed while checking backup')
+        validate_batch(path)
+        result = directory / 'batch_plan_private.json'
+        save(result, bound)
+        save(directory / 'review_private.json', describe_batch(result))
+        save(directory / 'generation_origin_private.json', {'path': str(path), 'sha256': original_hash})
+        event(directory, 'batch_bind_complete', manifest_sha256=digest(result))
+        log('各日备份和完整方案已保存，未修改健康数据。核对后再清理手机所选各晚。')
+        return result
+    except Exception as error:
+        if directory.exists():
+            save_failure(directory, 'prepare_failure_private.json', {'message': user_message(error),
+                         'traceback': traceback.format_exc(), 'diagnostics': failure_details(error)})
+        raise
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def execute_batch(path, allow_sleep_delete=False, log=lambda message: None, phone_deleted=False):
     path = private(path)
     manifest, plans = validate_batch(path)
+    check(all(p['format_version'] != 3 for _, p in plans), 'Offline plan needs execution backup and review before apply')
     directory = path.parent
-    check(allow_sleep_delete is True, 'Explicit selected-night deletion confirmation required')
-    check(phone_deleted is True, 'Phone night deletion and empty cloud segments/summary required before rebuild')
+    origin = None
+    if all(p['format_version'] in [4, 6] for _, p in plans):
+        provenance = load(directory / 'generation_origin_private.json')
+        origin = private(provenance['path'])
+        check(digest(origin) == provenance['sha256'], 'Batch child plan changed')
+        _, originals = validate_batch(origin)
+        check([canonical(p['generation']) for _, p in plans] ==
+              [canonical(p['generation'] if p['format_version'] == 5 else p) for _, p in originals],
+              'Batch child plan changed')
+        check(not (origin.parent / 'generation_batch_apply_started_private.json').exists() and
+              not (origin.parent / 'batch_apply_started_private.json').exists(),
+              'An execution marker exists; do not repeat this plan')
+        check(all(not (c.parent / 'generation_apply_started_private.json').exists() and
+                  not (c.parent / 'apply_started_private.json').exists() for c, _ in originals),
+              'An execution marker exists; do not repeat this plan')
+    standalone = all(p.get('standalone_generated') for _, p in plans)
+    check(standalone or allow_sleep_delete is True, 'Explicit selected-night deletion confirmation required')
+    check(standalone or phone_deleted is True, 'Phone night deletion and empty cloud segments/summary required before rebuild')
     check(not (directory / 'batch_apply_started_private.json').exists(), 'An execution marker exists; do not repeat this plan')
     check(all(not (child.parent / 'apply_started_private.json').exists() for child, _ in plans),
           'An execution marker exists; do not repeat this plan')
+    if standalone:
+        check(all(not (child.parent / 'generation_apply_started_private.json').exists() for child, p in plans
+                  if p['format_version'] == 5), 'An execution marker exists; do not repeat this plan')
     lock = directory.parent / '.health_panel.lock'
     with lock.open('x', encoding='utf-8') as handle:
         handle.write(str(directory))
@@ -136,22 +209,39 @@ def execute_batch(path, allow_sleep_delete=False, log=lambda message: None, phon
         # Every selected day is checked before the first write, each child checks again at execution.
         for child, plan in plans:
             log('执行前只读核验 ' + plan['config']['date'] + '…')
-            with AutomationClient(plan['config']) as client:
+            connection = AutomationClient(plan['config'])
+            connection.startup_log = log
+            with connection as client:
                 current = snapshot_with_retry(client)
                 current['local_sleep'] = client.local_sleep()
+                if plan.get('standalone_generated'):
+                    resolved = standalone_preflight(plan, current, allow_sleep_delete, phone_deleted)
+                    from .standalone import bind_source
+                    from .sleep_preflight import registered_sleep_source, validate_sleep_upload
+                    source = registered_sleep_source(client, resolved) if resolved['sleep'] else client.upload_source()
+                    resolved = bind_source(resolved, source)
+                    validate_sleep_upload(resolved, source)
+                elif plan['sleep']:
+                    from .sleep_preflight import registered_sleep_source, validate_sleep_upload
+                    validate_sleep_upload(plan, registered_sleep_source(client, plan))
             save_failure(child.parent, 'batch_preflight_private.json', current)
-            check_baseline(current, plan['baseline'], plan, phone_deleted=True)
+            if not plan.get('standalone_generated'):
+                check_baseline(current, plan['baseline'], plan, phone_deleted=True)
         check(digest(path) == manifest_hash and all(digest(c) == child_hashes[str(c)] for c, _ in plans),
               'Plan changed while checking backup')
+        if origin is not None:
+            check(digest(origin) == provenance['sha256'], 'Batch child plan changed')
+            save(origin.parent / 'generation_batch_apply_started_private.json', {'manifest_sha256': provenance['sha256'],
+                 'execution_manifest_sha256': manifest_hash, 'execution_path': str(path)})
         save(directory / 'batch_apply_started_private.json', {'manifest_sha256': manifest_hash,
-             'dates': [e['date'] for e in manifest['days']], 'sleep_delete_authorized': True})
+             'dates': [e['date'] for e in manifest['days']], 'sleep_delete_authorized': bool(allow_sleep_delete)})
         started = True
         event(directory, 'batch_all_baselines_verified')
         for child, plan in plans:
             check(digest(child) == child_hashes[str(child)], 'Batch child plan changed')
             day = plan['config']['date']
             event(directory, 'batch_day_begin', date=day)
-            result = execute(child, allow_sleep_delete=True, log=lambda msg: log(day + '：' + msg), phone_deleted=True)
+            result = execute(child, allow_sleep_delete=allow_sleep_delete, log=lambda msg: log(day + '：' + msg), phone_deleted=phone_deleted)
             save(directory / ('day_' + day + '_result_private.json'), result)
             check(all(result['target_adopted'].values()) and result.get('sleep_cloud_segments_match') is True and
                   result.get('sleep_cloud_summary_match') is True, 'Batch day not adopted; later dates stopped')
@@ -182,6 +272,8 @@ def main():
         preview.add_argument('--' + name, required=True)
     review = sub.add_parser('review')
     review.add_argument('--plan', required=True)
+    binding = sub.add_parser('bind')
+    binding.add_argument('--plan', required=True)
     apply = sub.add_parser('apply')
     apply.add_argument('--plan', required=True)
     apply.add_argument('--allow-sleep-delete', action='store_true')
@@ -191,6 +283,11 @@ def main():
         if args.action == 'prepare':
             path = prepare_batch(load(private(args.config)), load(private(args.request)), args.start, args.end, args.job)
             result = describe_batch(path)
+            result['plan_path'] = str(path)
+        elif args.action == 'bind':
+            path = bind_batch(args.plan)
+            result = describe_batch(path)
+            result['plan_path'] = str(path)
         elif args.action == 'review':
             result = describe_batch(args.plan)
         else:

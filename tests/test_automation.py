@@ -15,7 +15,7 @@ BASE = bounds(CONFIG)[0]
 
 
 def health(begin, end, kind, key, value):
-    return {'type': kind, 'deviceCode': 'FABRICATED', 'startTime': str(begin), 'endTime': str(end),
+    return {'type': kind, 'deviceCode': '654321', 'startTime': str(begin), 'endTime': str(end),
             'timeZone': '+0800', 'mergedFlag': 0,
             'samplePoints': [{'key': key, 'value': value, 'startTime': str(begin), 'endTime': str(end)}]}
 
@@ -23,7 +23,7 @@ def health(begin, end, kind, key, value):
 def fixture():
     sleep = [health(BASE + (60 + i) * 60000, BASE + (61 + i) * 60000, 9,
                     ['PROFESSIONAL_SLEEP_SHALLOW', 'PROFESSIONAL_SLEEP_DEEP', 'PROFESSIONAL_SLEEP_DREAM'][i % 3], '') for i in range(300)]
-    sport = [{'deviceCode': 'FABRICATED', 'startTime': str(BASE + m * 60000), 'endTime': str(BASE + (m + 1) * 60000),
+    sport = [{'deviceCode': '654321', 'startTime': str(BASE + m * 60000), 'endTime': str(BASE + (m + 1) * 60000),
               'sportType': 5, 'appType': 1, 'timeZone': '+0800', 'mergedFields': ['steps', 'calorie'],
               'sportBasicInfos': [{'steps': 50, 'calorie': 1000}]} for m in [720, 721, 1080, 1081]]
     total = {'recordDay': 20010101, 'sportType': 0, 'dataSource': 999, 'deviceCode': '0', 'timeZone': '+0800',
@@ -33,7 +33,7 @@ def fixture():
             'active': {'resultCode': 0, 'detailInfos': [health(BASE + h * 3600000, BASE + (h + 1) * 3600000 - 1, 200005, 'ACTIVE_HOUR', '{"isActive":1}') for h in [12, 18]]},
             'intensity': {'resultCode': 0, 'detailInfos': [health(BASE + m * 60000, BASE + (m + 1) * 60000, 12, 'EXERCISE_INTENSITY', '{"exerciseType":1}') for m in [720, 1080]]},
             'sleep': {'resultCode': 0, 'detailInfos': sleep}, 'sleep_stats': {'resultCode': 0, 'professionalSleepTotal': [{'recordDay': 20010101,
-            'dataSource': 2, 'deviceCode': '0', 'timeZone': '+0800', 'professionalSleep': {'sleepScore': 72, 'allSleepTime': 300}}]}}
+            'dataSource': 2, 'deviceCode': '0', 'timeZone': '+0800', 'professionalSleep': {'sleepScore': 72, 'allSleepTime': 300, 'deviceCategory': 42}}]}}
 
 
 class FakeClient:
@@ -49,6 +49,10 @@ class FakeClient:
     def __enter__(self): return self
     def __exit__(self, *args): pass
     def configure(self, **values): self.config.update(values)
+    def upload_source(self):
+        return {'resultCode': 0, 'deviceCode': '123456', 'appType': 1,
+                'sleepSource': {'deviceCode': '654321', 'appType': 1, 'deviceCategory': 42,
+                                'sourceKind': 'registered_wearable'}}
     def snapshot(self): return copy.deepcopy(self.state)
     def guard_state(self): return {'processes': [], 'new_process_gate': True}
     def stats(self): return copy.deepcopy(self.state['sleep_stats'])

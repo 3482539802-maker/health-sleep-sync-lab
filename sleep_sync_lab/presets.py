@@ -5,7 +5,7 @@ from .sleep_generation import weighted_integer
 from .input_validation import validate_preset
 
 
-def preset_request(spec):
+def preset_request(spec, restore_original_score=False):
     validate_preset(spec)
     check(spec.get('version') == 1, 'Unsupported preset version')
     for field in ['calorie', 'exercise', 'active', 'bedtime', 'wake']:
@@ -17,7 +17,7 @@ def preset_request(spec):
             'sleep': {'mode': 'random', 'stage_model': 'natural_v2',
                       'bedtime_range': clocks(spec['bedtime']['range']), 'wake_range': clocks(spec['wake']['range']),
                       'duration_range': spec['duration_range'],
-                      'restore_original_score': spec.get('restore_original_score', False)}}
+                      'restore_original_score': restore_original_score}}
 
 
 def sample_preset(spec, rng):

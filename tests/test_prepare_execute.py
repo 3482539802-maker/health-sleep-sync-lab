@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from sleep_sync_lab.automation import prepare, execute, load, save
+from sleep_sync_lab.automation import prepare_with_backup as prepare, execute, load, save
 from sleep_sync_lab.errors import user_message
 from test_automation import CONFIG, FakeClient, fixture
 

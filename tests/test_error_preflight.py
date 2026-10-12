@@ -92,6 +92,47 @@ class LaunchRegressionTests(unittest.TestCase):
 
 
 class FieldPreflightTests(unittest.TestCase):
+    def test_blank_activity_limit_accepts_sleep_only_without_movement_targets(self):
+        request = {'activity_windows': '', 'sleep': {'mode': 'random',
+                   'bedtime_range': ['00:00', '01:00'], 'wake_range': ['07:00', '09:00'],
+                   'duration_range': [360, 480]}}
+        self.assertEqual(activity_windows(''), '00:00-24:00')
+        self.assertEqual(activity_windows('  '), '00:00-24:00')
+        validate_request(request)
+        from sleep_sync_lab.generation import generate
+        from sleep_sync_lab.standalone import empty_snapshot, resolve
+        plan = generate(CONFIG, dict(request, planning_mode='standalone'), 13)
+        self.assertTrue(plan['sleep'])
+        self.assertTrue(all(v is None for v in plan['targets'].values()))
+        resolved = resolve(plan, empty_snapshot())
+        self.assertEqual(resolved['sport'], [])
+        self.assertEqual(resolved['intensity'], [])
+        self.assertEqual(resolved['active'], [])
+
+    def test_blank_limit_does_not_turn_entirely_empty_form_into_a_task(self):
+        with self.assertRaisesRegex(InputValidationError, '修改目标'):
+            validate_request({'activity_windows': ''})
+
+    def test_custom_panel_empty_movement_fields_preserve_sleep_request(self):
+        def variable(value):
+            result = Mock()
+            result.get.return_value = value
+            return result
+        panel = Panel.__new__(Panel)
+        panel.scheme = variable('自定义')
+        panel.vars = {key: variable('') for key in ['calorie', 'exercise', 'steps', 'active',
+                                                   'activity_windows', 'active_hours']}
+        panel.vars.update(bedtime_range=variable('00:00-01:00'), wake_range=variable('07:00-09:59'),
+                          duration_range=variable('360-539'))
+        panel.preserve = variable(True)
+        panel.sleep_enabled = variable(True)
+        panel.sleep_mode = variable('random')
+        panel.restore_score = variable(False)
+        request = panel.request()
+        self.assertTrue(all(request.get(k) is None for k in ['calorie', 'exercise', 'steps', 'active']))
+        self.assertEqual(request['activity_windows'], '00:00-24:00')
+        self.assertEqual(request['sleep']['mode'], 'random')
+
     def test_signed_shift_and_fullwidth_delimiters(self):
         self.assertEqual(number('-60--30', '提前分钟', -720, 720), [-60, -30])
         self.assertEqual(number('30～60', '锻炼分钟', 0, 1440), [30, 60])

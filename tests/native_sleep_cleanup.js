@@ -5,6 +5,8 @@ const db = new DatabaseSync(':memory:');
 db.exec(`CREATE TABLE sample_session_core(id INTEGER, start_time INTEGER, end_time INTEGER, type_id INTEGER, sync_status INTEGER);
  CREATE TABLE hihealth_stat_day(id INTEGER, date INTEGER, stat_type INTEGER, sync_status INTEGER);
  CREATE TABLE sample_point_health(id INTEGER, start_time INTEGER, end_time INTEGER, type_id INTEGER, sync_status INTEGER);
+ CREATE TABLE sync_cache(id INTEGER, dataTime INTEGER);
+ INSERT INTO sync_cache VALUES(1,150),(2,350);
  INSERT INTO sample_session_core VALUES (1,100,200,22101,2),(2,100,200,22101,1),(3,300,400,22101,2),(4,100,200,999,2);
  INSERT INTO hihealth_stat_day VALUES(1,20010101,44100,2),(2,20010102,44100,2),(3,20010101,999,2);
  INSERT INTO sample_point_health VALUES(1,150,150,90001,1),(2,150,150,90001,2),(3,350,350,90001,1),(4,150,150,999,1);`);
@@ -16,14 +18,15 @@ const adapter = {
  endTransaction() { db.exec(committed ? 'COMMIT' : 'ROLLBACK'); },
  rawQuery: { overload: () => ({call(self, sql) {
   const row = db.prepare(sql).get();
-  return {moveToFirst: () => true, getInt: () => Object.values(row)[0], close() {}};
+  return {moveToFirst: () => true, getInt: () => Object.values(row)[0], getLong: () => Object.values(row)[0], close() {}};
  }}) },
  execSQL: { overload: () => ({call(self, sql) {
   if (failDelete && sql.includes('hihealth_stat_day')) throw new Error('Artificial DB failure');
   db.exec(sql);
  }}) }
 };
-const config = {record_day: 20010101, delete_scope: {start: 100, end: 200}, sleep_cloud_empty_verified: false};
+const config = {record_day: 20010101, sleep_query_start_ms:100, sleep_query_end_ms:200,
+ delete_scope: {start: 100, end: 200}, sleep_cloud_empty_verified: false};
 const box = {config, rpc: {exports: {}}, nativeCall: fn => Promise.resolve().then(fn), Java: {
  choose(name, handlers) { handlers.onMatch(adapter); handlers.onComplete(); },
  retain: x => x, array: (name, x) => x,
@@ -32,6 +35,11 @@ const box = {config, rpc: {exports: {}}, nativeCall: fn => Promise.resolve().the
 vm.runInNewContext(fs.readFileSync(require('node:path').join(__dirname, '../sleep_sync_lab/automation_native.js'), 'utf8'), box);
 const ids = table => db.prepare('SELECT id FROM ' + table + ' ORDER BY id').all().map(r => r.id);
 (async () => {
+ const inspection = await box.rpc.exports.autoInspectSleepSources();
+ assert.equal(inspection.resultCode,0);
+ assert.deepEqual(JSON.parse(JSON.stringify(inspection.counts)),{core:2,stats:1,dictionary:2,syncCache:1});
+ assert.deepEqual(ids('sample_session_core'),[1,2,3,4]);
+ assert.equal(transactions,0);
  const cleanup = box.rpc.exports.autoRetireAcknowledgedSleepDeletes;
  await assert.rejects(cleanup(100,200), /No verified cloud deletion/);
  assert.equal(transactions,0);

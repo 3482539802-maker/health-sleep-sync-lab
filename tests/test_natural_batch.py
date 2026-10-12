@@ -170,8 +170,9 @@ class BatchTests(unittest.TestCase):
         MultiClient.fail_upload = False
 
     def prepare(self, directory):
-        with patch('sleep_sync_lab.batch.AutomationClient', MultiClient):
-            path = batch.prepare_batch(CONFIG, preset_request(SPEC), *self.days, directory)
+        path = batch.prepare_batch(CONFIG, dict(preset_request(SPEC), planning_mode='legacy'), *self.days, directory)
+        with patch('sleep_sync_lab.automation.AutomationClient', MultiClient):
+            path = batch.bind_batch(path)
         # Simulate the user's original-phone deletion AFTER the immutable backup.
         for state in MultiClient.states.values():
             state['sleep']['detailInfos'] = []

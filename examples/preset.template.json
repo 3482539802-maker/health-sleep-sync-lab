@@ -6,5 +6,5 @@
   "bedtime": {"range": [0, 90], "preferred": [15, 45]},
   "wake": {"range": [420, 570], "preferred": [450, 510]},
   "duration_range": [360, 525],
-  "restore_original_score": true
+  "restore_original_score": false
 }

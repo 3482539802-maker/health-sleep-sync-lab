@@ -1,5 +1,6 @@
 """Launch failures stop before writes and provide safe diagnostics."""
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -11,9 +12,51 @@ from sleep_sync_lab.automation_model import build_plan
 
 
 class StartupTests(unittest.TestCase):
+    def setUp(self):
+        # These check-only cases must not read the developer's local startup profile.
+        patcher = patch('sleep_sync_lab.automation_client.load_profile', return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def client(self):
-        config = dict(CONFIG, serial='emulator-5554', package='com.huawei.health')
+        config = dict(CONFIG, serial='emulator-5554', package='com.huawei.health', adb='synthetic-adb')
         return AutomationClient(config)
+
+    def test_missing_emulator_reports_connection_before_cpu_or_app_start(self):
+        client = self.client()
+        client.config['emulator_verified'] = True
+        client.verify_adb = Mock()
+        client.adb = Mock(side_effect=AssertionError('Hardware/app action must not start'))
+        result = subprocess.CompletedProcess([], 0, b'List of devices attached\n\n', b'')
+        with patch('sleep_sync_lab.automation_client.run_adb', return_value=result):
+            with self.assertRaises(PanelOperationError) as caught: client.__enter__()
+        message = user_message(caught.exception)
+        self.assertIn('未连接', message)
+        self.assertIn('生成计划可以离线', message)
+        self.assertNotIn('CPU', message)
+        client.adb.assert_not_called()
+        self.assertFalse(client.lock_owned)
+
+    def test_connection_never_falls_back_to_phone_or_other_emulator(self):
+        client = self.client()
+        result = subprocess.CompletedProcess([], 0, b'List of devices attached\nPRIVATE_PHONE\tdevice\nemulator-5556\tdevice\n', b'')
+        with patch('sleep_sync_lab.automation_client.run_adb', return_value=result):
+            with self.assertRaises(PanelOperationError) as caught: client.verify_connection()
+        self.assertNotIn('PRIVATE_PHONE', user_message(caught.exception))
+        self.assertEqual(client.config['serial'], 'emulator-5554')
+
+    def test_connection_reports_offline_and_unauthorized_separately(self):
+        for status, expected in [('offline', 'offline'), ('unauthorized', '尚未授权')]:
+            result = subprocess.CompletedProcess([], 0, f'List of devices attached\nemulator-5554\t{status}\n'.encode(), b'')
+            with patch('sleep_sync_lab.automation_client.run_adb', return_value=result):
+                with self.assertRaises(PanelOperationError) as caught: self.client().verify_connection()
+            self.assertIn(expected, user_message(caught.exception))
+
+    def test_connection_accepts_only_configured_online_emulator(self):
+        result = subprocess.CompletedProcess([], 0, b'List of devices attached\nemulator-5554\tdevice\n', b'')
+        with patch('sleep_sync_lab.automation_client.run_adb', return_value=result) as adb:
+            self.client().verify_connection()
+        self.assertIsNone(adb.call_args.kwargs.get('serial'))
 
     def test_direct_resolved_activity_no_monkey_events(self):
         client = self.client()

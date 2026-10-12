@@ -1,47 +1,74 @@
 # Health Sleep Sync Lab
 
-华为运动健康睡眠与运动数据调整工具、桌面脚本面板与 AI 交接流程。目标是在手机现有原版入口采用授权调整的数据，保持手机系统时间正常。
+华为运动健康三环、步数和单晚睡眠的研究工具。提供中文面板、离线计划、限定执行、云端读回，以及从正确备份恢复固定睡眠的独立任务。最终验收位置是手机现有原版运动健康，手机无需 Root，也无需改变系统时间。
 
-已观察到的行为：云端新增分段可进入手机；仅从云端删除分段时，手机可能保留旧段。针对单个已授权日期，从手机原版删除当天睡眠，再按备份重建分段，已完成一次原版手机入口验证。睡眠评分属于独立汇总，单纯恢复分段可能不会恢复评分；随后恢复备份中的原评分，用户正常同步后已确认手机显示恢复。
+**新使用者从[完整复现指南](docs/REPRODUCE.md)开始，首次搭建电脑见[环境安装](docs/SETUP.md)。** 仓库包含原创工具和泛化方法，不含真实健康记录、账号、设备 ID、截图、数据库、私有路径、APK 或厂商反编译源码。公开 JSON 和测试数据均为人工示例，使用者填写自己的配置并在仓库外保存任务。
 
-这里提供通用的备份、计划校验、限定上传和原评分恢复工具。工具源自已验证的方法，但通用版本没有在所有设备、日期或应用版本上验证。**公开仓库不包含参与者的健康记录、实验日期、截图、设备标识、账号、访问凭据或电脑路径。** 示例数据均为人工构造。
+## 可以复现的流程
 
-## 开始
+| 场景 | 入口与行为 |
+| --- | --- |
+| 空白日期新增 | 面板离线生成三环、配套步数、随机睡眠及汇总；有原值才比较，缺值跳过；生成不启动 ADB |
+| 已有睡眠替换 | 先保存备份和固定方案，手机原版仅删除所选晚并同步，核验云空，清电脑旧源／删除队列后重建 |
+| 恢复同一套正确阶段 | sleep_repair 从自己此前验收正确的六域快照建立新任务，保留时间、阶段、完整睡眠汇总和备份评分，不重新随机生成 |
+| 显示评分 | 不提交、恢复原评分、脚本分段估算三种模式；新估算上限 95，记录非华为官方评分 |
+| 模拟器关闭 | 首次配置受管理实例后，连接需要时自动启动指定实例；已运行不重启，退出停用电脑健康应用并保留隔离 |
 
-睡眠延迟回流已暴露原自动删除流程缺口。当前要求先保存完整计划，从手机原版删除所选晚并同步；程序确认云分段／汇总为空、电脑旧源及删除队列清空后才重建。主进程／后台同时隔离，退出保留研究电脑应用的网络阻断。见[原因与修复](docs/SLEEP_RECURRENCE.md)。长期行为仍需手机及手表同步验收。
+已验证的方法包括单晚云分段／汇总恢复、手机原版起止／时长／来源／评分显示，以及手表关机条件下手机正常同步后的短期云读回。新公开固定恢复工具由同一方法泛化并通过人工测试，没有在新的真实账号上重新执行。空白日期全项目上传、真实多日批量和重新开表后的长期稳定性仍需分别验收。
 
-继续开发先读[脚本优化交接](docs/DEVELOPMENT_HANDOFF.md)和[AGENTS.md](AGENTS.md)。当前睡眠采用手机先清源、云空核验、电脑旧源／删除队列清理再重建的流程；原自动电脑／云删除路径的延迟问题已记录。当前89项人工Python测试及适配器JS的人工SQLite事务验证通过，手机显示及持续同步稳定性仍分别验收。运行时间线、源码版本和失败诊断均保存在私有任务目录。
+## 安装与启动
 
-新增桌面面板：双击`run_panel.cmd`或运行`python -m sleep_sync_lab.panel`。支持三环、步数固定／随机目标，睡眠整体提前／随机生成，备份、计划查看、限定执行与云读回。完整设置与证据边界见[自动化说明](docs/AUTOMATION.md)。自动睡眠已有单晚真实云核验，手机本地及长期行为不能由此保证；活动小时新增已云端验证，运动数值下调可能不采用。
+适配环境为 Windows、带 Tk 的 Python 3.10+、独立电脑安卓模拟器、ADB、模拟器 Root、原版运动健康 **17.0.8.310**、Frida server **17.23.1**。Python 依赖固定在 [requirements.txt](requirements.txt)。其他应用版本需要重新核对内部类和协议。
 
-需要 Python 3.10+、ADB、电脑上的独立安卓模拟器，以及该模拟器里已登录的原版运动健康。当前适配器针对运动健康17.0.8.310，使用 Frida17 的 Java bridge；手机本身不需要 Root。版本改变后必须重新核对内部类和签名。
-
-```console
-python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
-python -m sleep_sync_lab --help
+```powershell
+git clone https://github.com/3482539802-maker/health-sleep-sync-lab.git
+Set-Location health-sleep-sync-lab
+$labRoot = Join-Path $env:LOCALAPPDATA 'HealthSleepSyncLab'
+New-Item -ItemType Directory -Force -Path $labRoot | Out-Null
+py -3 -m venv (Join-Path $labRoot 'venv')
+$py = Join-Path $labRoot 'venv/Scripts/python.exe'
+& $py -m pip install -r requirements.txt
+& $py -m unittest discover -s tests -v
 ```
 
-全部真实配置和输出放在仓库外的私有目录。将[配置模板](examples/config.template.json)复制到该目录，填写自己的模拟器和目标日期。不要在仓库里登录、保存真实数据或运行公开日志采集。
+按[环境安装](docs/SETUP.md)完成自己的配置、原版登录、Frida 服务和实例开机隔离，再启动：
 
-```console
-python -m sleep_sync_lab backup --config /private/config.json --out /private/before.json
-python -m sleep_sync_lab plan --backup /private/before.json --target-start 2001-01-01T00:00:00+08:00 --target-end 2001-01-01T00:06:00+08:00 --reference-start 2001-01-01T02:00:00+08:00 --out /private/plan.json
+```powershell
+$config = Join-Path $labRoot 'config.json'
+& $py -m sleep_sync_lab.panel --config $config --runs (Join-Path $labRoot 'runs')
 ```
 
-上面日期仅是构造示例。原CLI与当前面板睡眠流程都需要手机先删除所选晚并正常同步；面板随后验证云空、清电脑旧源／已完成删除队列并分批重建。先保存完整计划再删手机记录。工具不清除手机应用数据。先阅读[自动化说明](docs/AUTOMATION.md)与[AI交接流程](docs/AI_HANDOFF.md)。
+run_panel.cmd 也是入口，但运行它的 Python 必须安装同一依赖；仓库没有作者电脑的配置或快捷方式。窗口打开和计划生成不写健康数据。
 
-## 重要限制
+## 操作顺序
 
-- 内容备份不保证恢复服务器版本、审计历史或全部派生统计。已观察到某次目标recordId一致，但这不是通用恢复保证。
-- 复制其他时段阶段序列得到的是合成数据，不能当作该时段实际监测结果。
-- 恢复原评分不等于官方算法重新计算修改后的睡眠；无原评分备份时不要编造分数。
-- 现支持经审阅的日期区间默认方案；未来定时每日处理、重新同步手表后的稳定性、全历史及周月年一致性没有完整验证。
-- 原版接口接受请求不证明符合服务条款，也不保证修改不可识别。
+1. 选择自己的目标日期和项目。自定义三环／步数留空表示不改，活动时段留空表示不限；只改睡眠时四个运动目标留空并勾选睡眠。
+2. 随机睡眠可以完全离线生成。整体提前需要原阶段，恢复原评分需要删除前评分；已有睡眠替换先保存备份。见[按需原数据](docs/OFFLINE_PLANS.md)。
+3. 审阅固定计划。已有睡眠时手机原版仅删所选一晚并同步；空白日期无需删除。程序核验云空、穿戴来源／类别和完整目标后分批上传。
+4. 核对云完整旧／新窗、实际阶段和汇总；手机正常同步核对起止、时长、阶段、来源和评分，退出电脑会话后再独立读回。
+5. 旧尾段或原阶段回流时保留证据和全部 started，从自己此前正确快照创建新的固定恢复任务。见[恢复分支](docs/REPRODUCE.md#从正确快照恢复固定睡眠)，不要重跑旧任务或删标记。
 
-参见[研究结论](docs/FINDINGS.md)、[隐私与发布规则](docs/PRIVACY.md)、[故障处理](docs/TROUBLESHOOTING.md)。源码采用[MIT许可](LICENSE)；不分发华为APK、反编译源码、模拟器映像或其他厂商二进制。本项目与华为无隶属关系。
+## 实际边界
 
+- 请求成功、recordId 仍在、条数正确都不足以证明实际内容或手机采用，必须核对完整时间／阶段／来源和汇总。
+- 手机删一晚、清电脑源不会删除手表原始文件。穿戴文件可能重新导入并生成原阶段；关表隔离短期验收不能证明唯一上传端或永久解决回流。
+- 原评分是复制备份；脚本估算不是华为官方重算或医学评分。手机数值栏不能附估算标签，工具保留评分来源。
+- 详情“记录到运动健康的时间”来自本地修改时间。电脑本地元数据实验可改变并恢复该栏，云端指定该栏尚无已验证方法；generateTime 不代替它。
+- 运动修改可能影响活动小时等派生统计，下调也可能不采用；内容备份不保证恢复服务器版本、审计历史或全部周月年统计。
 
-## 自然睡眠与默认批量更新
+## 文档
 
-新请求使用natural_v2，允许少量3–9分钟阶段、减少超过50分钟连续块，旧V1和legacy计划仍按原算法校验。私有可配置钟形预设支持三环只增、默认步数不改、运动避开旧／新睡眠和日期区间独立生成；逐日哈希及started、全部日期写前核验、失败停止。89项人工测试通过。真实多日写入与长期手机／手表同步仍另验收。详见[NATURAL_SLEEP_AND_BATCH](docs/NATURAL_SLEEP_AND_BATCH.md)及[更新记录](CHANGELOG.md)。
+| 文档 | 内容 |
+| --- | --- |
+| [SETUP](docs/SETUP.md) | 新电脑、模拟器、ADB、登录、Frida、配置和自动启动 |
+| [REPRODUCE](docs/REPRODUCE.md) | 正常新增／替换、固定恢复、手机和延迟验收 |
+| [AUTOMATION](docs/AUTOMATION.md)／[OFFLINE_PLANS](docs/OFFLINE_PLANS.md) | 当前面板／CLI和按需规则 |
+| [SLEEP_SCORE](docs/SLEEP_SCORE.md) | 评分规则和睡眠来源检查 |
+| [SLEEP_RECURRENCE](docs/SLEEP_RECURRENCE.md) | 旧尾段、阶段重传、删除队列和清源 |
+| [TROUBLESHOOTING](docs/TROUBLESHOOTING.md) | 连接、来源、详情空白和中断 |
+| [DEVELOPMENT_HANDOFF](docs/DEVELOPMENT_HANDOFF.md) | 源码地图、验证和继续开发 |
+| [PRIVACY](docs/PRIVACY.md) | 公开／私有分离及发布 |
+
+历史 python -m sleep_sync_lab CLI 保留兼容，但没有当前受管理启动和完整双进程保护；新使用者采用面板、automation 和 sleep_repair。历史说明不覆盖当前流程。
+
+源码采用 [MIT 许可](LICENSE)。不分发华为 APK、模拟器映像或 Frida 二进制，与华为无隶属关系。内部接口行为不保证长期不变，也不保证修改不可识别。

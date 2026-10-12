@@ -8,6 +8,7 @@ from .client import Client
 from .model import check
 from .errors import PanelOperationError, AdbOperationError, AdbLaunchError
 from .host_process import run_adb
+from .emulator_startup import load_profile
 
 
 class AutomationClient(Client):
@@ -21,6 +22,28 @@ class AutomationClient(Client):
             error = PanelOperationError('配置的ADB程序未返回正确版本信息。请在私有配置的 adb 字段选择可用的ADB。')
             error.command, error.stdout, error.stderr = ['version'], result.stdout, result.stderr
             raise error
+
+    def verify_connection(self):
+        """Check the configured target before hardware probes; never choose another device."""
+        result = run_adb(self.config['adb'], ['devices'], timeout=10)
+        devices = {}
+        for line in result.stdout.decode('utf-8', 'replace').splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and not line.startswith('List of devices'):
+                devices[parts[0]] = parts[1]
+        status = devices.get(self.config['serial'])
+        if status == 'device':
+            return
+        if status == 'offline':
+            message = '配置的电脑模拟器处于offline状态，尚未写入。请等待模拟器启动完成并恢复ADB连接，再执行当前计划。'
+        elif status == 'unauthorized':
+            message = '配置的电脑模拟器ADB尚未授权，尚未写入。请完成该模拟器的调试授权，再执行当前计划。'
+        else:
+            message = ('配置的电脑模拟器未连接，尚未写入。生成计划可以离线，实际上传需要已配置的模拟器在线。'
+                       '请确认隔离实例已启动，再执行当前计划；不需要重新生成方案或再次删除手机睡眠。')
+        error = PanelOperationError(message)
+        error.command, error.stdout, error.stderr = ['devices'], result.stdout, result.stderr
+        raise error
 
     def launch_original(self):
         """Launch the resolved original activity directly, never generate monkey events."""
@@ -56,10 +79,13 @@ class AutomationClient(Client):
         self.extra_sessions = []
         self.guard_reports = []
         self.guard_scripts = []
+        self.guard_script_pids = []
         self.guarded_pids = set()
         self.spawn_device = None
         self.paused_spawns = []
         self.quarantine_confirmed = False
+        self.emulator = None
+        self.startup_log = lambda message: None
         self.session_lock = Path.home() / '.health_sleep_sync_lab' / ('session_' + re.sub(r'[^a-zA-Z0-9_]', '_', self.config['serial']) + '.lock')
 
     def verify_root(self):
@@ -82,12 +108,8 @@ class AutomationClient(Client):
         error.attempts = failures
         raise error from last_error
 
-    def __enter__(self):
-        # Verify PC environment before any stop/start/network mutation.
-        self.verify_adb()
-        check(re.fullmatch(r'emulator-\d+|127\.0\.0\.1:\d+', self.config['serial']) is not None,
-              'Only the configured PC emulator is supported')
-        check(self.config.get('emulator_verified') is True, 'PC emulator verification required')
+    def validate_environment(self):
+        self.verify_connection()
         check(self.adb('shell', 'getprop', 'ro.product.cpu.abi') in ['x86', 'x86_64'], 'PC CPU mismatch')
         for key, prop in [('expected_emulator_model', 'ro.product.model'), ('expected_emulator_board', 'ro.product.board')]:
             check(bool(self.config.get(key)) and self.adb('shell', 'getprop', prop) == self.config[key], 'PC profile mismatch')
@@ -107,9 +129,23 @@ class AutomationClient(Client):
             raise ValueError('Another PC emulator session or stale session lock exists')
         self.lock_owned = True
         self.validated = True
+
+    def __enter__(self):
+        self.verify_adb()
+        check(re.fullmatch(r'emulator-\d+|127\.0\.0\.1:\d+', self.config['serial']) is not None,
+              'Only the configured PC emulator is supported')
+        check(self.config.get('emulator_verified') is True, 'PC emulator verification required')
+        self.emulator = load_profile(self.config)
         try:
+            if self.emulator:
+                self.emulator.log = self.startup_log
+                self.emulator.ensure_ready()
+            self.validate_environment()
             self.adb('shell', 'am', 'force-stop', self.config['package'])
+            self.set_quarantine(True)
             self.set_offline(True)
+            if self.emulator:
+                self.emulator.activate(self)
             self.launch_original()
             super().__enter__()
             self.script.unload()
@@ -127,7 +163,10 @@ class AutomationClient(Client):
             self.set_offline(False)
             return self
         except BaseException:
-            self.__exit__(None, None, None)
+            if self.validated:
+                self.__exit__(None, None, None)
+            elif self.emulator:
+                self.emulator.release()
             raise
 
     def guard_other_processes(self, source):
@@ -149,6 +188,7 @@ class AutomationClient(Client):
             report = script.exports_sync.auto_guard()
             self.guard_reports.append({'process': process.name, 'guard': report})
             self.guard_scripts.append(script)
+            self.guard_script_pids.append(process.pid)
             self.guarded_pids.add(process.pid)
             guarded.add(process.name)
         check(all(p.name in guarded for p in device.enumerate_processes() if
@@ -178,8 +218,29 @@ class AutomationClient(Client):
 
     def guard_state(self):
         self.assert_guarded()
-        return {'processes': self.guard_reports, 'daemon': self.script.exports_sync.auto_guard_state(),
-                'other_processes': [s.exports_sync.auto_guard_state() for s in self.guard_scripts],
+        daemon = self.script.exports_sync.auto_guard_state()
+        others, retired = [], []
+        check(len(self.guard_scripts) == len(self.guard_script_pids), 'Guard process mapping incomplete')
+        def live_pids():
+            check(self.spawn_device is not None, 'Guard process mapping unavailable')
+            return {p.pid for p in self.spawn_device.enumerate_processes()}
+        active = live_pids() if self.guard_scripts else set()
+        for pid, script in zip(self.guard_script_pids, self.guard_scripts):
+            if pid not in active:
+                retired.append(pid)
+                continue
+            try:
+                others.append(script.exports_sync.auto_guard_state())
+            except Exception:
+                # A companion can exit between enumeration and the read-only RPC.
+                # Ignore its retired script only after confirming that PID is gone.
+                self.assert_guarded()
+                if pid in live_pids():
+                    raise
+                retired.append(pid)
+        self.assert_guarded()
+        return {'processes': self.guard_reports, 'daemon': daemon,
+                'other_processes': others, 'retired_process_pids': retired,
                 'new_process_gate': self.spawn_device is not None, 'paused_spawns': self.paused_spawns}
 
     def configure(self, **updates):
@@ -228,9 +289,22 @@ class AutomationClient(Client):
         self.assert_guarded()
         return self.script.exports_sync.auto_health_read(kind, start, end)
 
+    def upload_source(self):
+        self.assert_guarded()
+        try:
+            return self.script.exports_sync.auto_upload_source()
+        except Exception as error:
+            if re.fullmatch(r'(?:Error: )*Registered sleep device unavailable or ambiguous', str(error).partition('\n')[0]):
+                raise PanelOperationError('没有唯一可用的已登记穿戴设备睡眠来源，尚未写入。请核对设备登记；多个来源时在私有配置选择 sleep_upload_device_code。无需历史睡眠模板。') from error
+            raise
+
     def local_sleep(self):
         self.assert_guarded()
         return self.script.exports_sync.auto_local_sleep()
+
+    def inspect_sleep_sources(self):
+        self.assert_guarded()
+        return self.script.exports_sync.auto_inspect_sleep_sources()
 
     def upload_health(self, records):
         self.assert_guarded()
@@ -267,6 +341,8 @@ class AutomationClient(Client):
                     self.adb('shell', 'am', 'force-stop', self.config['package'])
                 finally:
                     self.set_quarantine(True)
+                if self.emulator:
+                    self.emulator.park(self)
         finally:
             if self.validated and not self.quarantine_confirmed:
                 # If stop/quarantine failed after a connected session, block first.
@@ -293,6 +369,9 @@ class AutomationClient(Client):
                 # If stop/quarantine failed, retain session firewall and lock.
                 if self.quarantine_confirmed or not self.validated:
                     self.set_offline(False)
-                if self.lock_owned and self.quarantine_confirmed:
+                parked = self.emulator is None or self.emulator.parked_proof()
+                if self.lock_owned and self.quarantine_confirmed and parked:
                     self.session_lock.unlink(missing_ok=True)
                     self.lock_owned = False
+                if self.emulator and self.quarantine_confirmed and parked:
+                    self.emulator.release()

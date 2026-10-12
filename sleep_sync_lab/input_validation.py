@@ -63,8 +63,11 @@ def time_range(value, field, activity=False):
 
 def activity_windows(value):
     field = '允许分配的时段'
-    if not isinstance(value, str) or not value.strip():
-        raise InputValidationError(field, value, '至少填写一个活动时段')
+    if value is None or isinstance(value, str) and not value.strip():
+        # This field constrains movement; it never requests movement by itself.
+        return '00:00-24:00'
+    if not isinstance(value, str):
+        raise InputValidationError(field, value, '请填写活动时段文本，留空表示不限制时段')
     ranges = [time_range(part.strip(), field, True) for part in normalized(value).split(',')]
     if any(a >= b for a, b in ranges):
         raise InputValidationError(field, value, '每个活动时段须在当日内、开始早于结束；跨午夜请拆成两段')
@@ -161,6 +164,14 @@ def validate_request(request):
             raise InputValidationError('睡眠模式', sleep.get('mode'), '请选择整体提前或随机')
     if not sleep and not request.get('preset') and all(request.get(key) is None for key in TARGETS):
         raise InputValidationError('修改目标', '', '请至少填写一个三环／步数目标或勾选调整睡眠')
+    if sleep:
+        from .sleep_scoring import score_mode
+        try:
+            score_mode(sleep)
+        except ValueError:
+            raise InputValidationError('睡眠评分', sleep.get('score_mode'), '请选择不提交评分、恢复原评分或脚本估算；不能同时选择两种模式') from None
+        if sleep.get('score_model') not in [None, 'stage_estimate_v1', 'stage_estimate_v2']:
+            raise InputValidationError('睡眠评分算法', sleep.get('score_model'), '当前支持stage_estimate_v1或stage_estimate_v2')
     return request
 
 
